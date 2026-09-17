@@ -640,12 +640,25 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
     unsigned consecutive_bridge_health_failures = 0;
     unsigned loop_count = 0;
     unsigned last_health_frame = 0;
+    unsigned activity_frames = 0;
+    unsigned input_transitions = 0;
+    unsigned transition_logs = 0;
+    uint32_t previous_buttons = 0;
+    uint8_t previous_lx = 0;
+    uint8_t previous_ly = 0;
+    uint8_t previous_rx = 0;
+    uint8_t previous_ry = 0;
+    uint8_t previous_l2 = 0;
+    uint8_t previous_r2 = 0;
+    int have_previous_input = 0;
     uint64_t disconnect_started_ms = 0;
     unsigned disconnect_frames = 0;
     unsigned disconnect_grace_events = 0;
     unsigned disconnect_grace_expired = 0;
     PoorDS4GameBridgeStatus last_bridge_status;
     memset(&last_bridge_status, 0, sizeof(last_bridge_status));
+    PoorDS4RemoteReaderStatus last_reader_status;
+    memset(&last_reader_status, 0, sizeof(last_reader_status));
     int game_alive = 1;
     GameSessionEndReason end_reason = SESSION_END_STOP_REQUESTED;
     write_supervisor_state(
@@ -659,6 +672,53 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
             consecutive_read_failures = 0;
             if (seq != last_seq) {
                 input_frames++;
+                int input_changed = have_previous_input &&
+                    (pad.buttons != previous_buttons ||
+                     pad.leftStick.x > previous_lx + 4 ||
+                     previous_lx > pad.leftStick.x + 4 ||
+                     pad.leftStick.y > previous_ly + 4 ||
+                     previous_ly > pad.leftStick.y + 4 ||
+                     pad.rightStick.x > previous_rx + 4 ||
+                     previous_rx > pad.rightStick.x + 4 ||
+                     pad.rightStick.y > previous_ry + 4 ||
+                     previous_ry > pad.rightStick.y + 4 ||
+                     pad.analogButtons.l2 != previous_l2 ||
+                     pad.analogButtons.r2 != previous_r2);
+                int input_active = pad.buttons != 0 ||
+                    pad.analogButtons.l2 != 0 ||
+                    pad.analogButtons.r2 != 0 ||
+                    pad.leftStick.x < 112 || pad.leftStick.x > 144 ||
+                    pad.leftStick.y < 112 || pad.leftStick.y > 144 ||
+                    pad.rightStick.x < 112 || pad.rightStick.x > 144 ||
+                    pad.rightStick.y < 112 || pad.rightStick.y > 144;
+                if (input_active)
+                    activity_frames++;
+                if (input_changed) {
+                    input_transitions++;
+                    if (transition_logs < 32u ||
+                        (input_transitions % 128u) == 0) {
+                        poords4_log(
+                            "[PoorDS4] SOURCE INPUT transition=%u frame=%u "
+                            "seq=%u buttons=0x%08x sticks=%u,%u,%u,%u "
+                            "triggers=%u,%u connected=%u timestamp=%llu "
+                            "count=%u\n",
+                            input_transitions, input_frames, seq,
+                            pad.buttons, pad.leftStick.x, pad.leftStick.y,
+                            pad.rightStick.x, pad.rightStick.y,
+                            pad.analogButtons.l2, pad.analogButtons.r2,
+                            pad.connected,
+                            (unsigned long long)pad.timestamp, pad.count);
+                        transition_logs++;
+                    }
+                }
+                previous_buttons = pad.buttons;
+                previous_lx = pad.leftStick.x;
+                previous_ly = pad.leftStick.y;
+                previous_rx = pad.rightStick.x;
+                previous_ry = pad.rightStick.y;
+                previous_l2 = pad.analogButtons.l2;
+                previous_r2 = pad.analogButtons.r2;
+                have_previous_input = 1;
                 if (!pad.connected) {
                     uint64_t now = monotonic_milliseconds();
                     if (disconnect_started_ms == 0) {
@@ -737,14 +797,34 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
             input_frames != last_health_frame) {
             poords4_log(
                 "[PoorDS4] BRIDGE HEALTH in=%u out=%u seq=%u conn=%u "
-                "buttons=0x%08x stale=%u read_fail=%u write_fail=%u "
+                "buttons=0x%08x sticks=%u,%u,%u,%u triggers=%u,%u "
+                "timestamp=%llu count=%u activity=%u transitions=%u "
+                "source_path=mode:%u queued:0x%08x ok:%u empty:%u "
+                "errors:%u state:%u "
+                "stale=%u read_fail=%u write_fail=%u "
                 "bridge_health_fail=%u bridge_ready=%d active=%u "
                 "packets=%llu lease_expirations=%llu pad_index=%d "
                 "contention=%llu info=%llu/%llu "
                 "info_result_overrides=%llu native_backing=%llu/%llu "
+                "paths=native:%llu connected:%llu fallback:%llu "
+                "direct_active:%llu native_result=0x%08x "
+                "native_sample=%llu activity:%llu conn:%u "
+                "buttons:0x%08x sticks:%u,%u,%u,%u triggers:%u,%u "
+                "timestamp:%llu count:%u "
                 "imports=%u\n",
                 input_frames, output_frames, last_seq, pad.connected,
-                pad.buttons, stale_frames, read_failures, write_failures,
+                pad.buttons, pad.leftStick.x, pad.leftStick.y,
+                pad.rightStick.x, pad.rightStick.y,
+                pad.analogButtons.l2, pad.analogButtons.r2,
+                (unsigned long long)pad.timestamp, pad.count,
+                activity_frames, input_transitions,
+                last_reader_status.reader_mode,
+                (uint32_t)last_reader_status.last_read_result,
+                last_reader_status.read_success_frames,
+                last_reader_status.read_empty_frames,
+                last_reader_status.read_error_frames,
+                last_reader_status.state_fallback_frames,
+                stale_frames, read_failures, write_failures,
                 consecutive_bridge_health_failures,
                 last_bridge_status.bridge_ready,
                 last_bridge_status.active,
@@ -764,6 +844,30 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
                     last_bridge_status.native_backing_calls,
                 (unsigned long long)
                     last_bridge_status.native_backing_errors,
+                (unsigned long long)
+                    last_bridge_status.native_passthrough_frames,
+                (unsigned long long)
+                    last_bridge_status.native_connected_frames,
+                (unsigned long long)
+                    last_bridge_status.direct_fallback_frames,
+                (unsigned long long)
+                    last_bridge_status.direct_active_fallbacks,
+                (uint32_t)last_bridge_status.last_native_result,
+                (unsigned long long)
+                    last_bridge_status.native_success_frames,
+                (unsigned long long)
+                    last_bridge_status.native_input_activity_frames,
+                last_bridge_status.last_native_connected,
+                last_bridge_status.last_native_buttons,
+                last_bridge_status.last_native_lx,
+                last_bridge_status.last_native_ly,
+                last_bridge_status.last_native_rx,
+                last_bridge_status.last_native_ry,
+                last_bridge_status.last_native_l2,
+                last_bridge_status.last_native_r2,
+                (unsigned long long)
+                    last_bridge_status.last_native_timestamp,
+                last_bridge_status.last_native_count,
                 last_bridge_status.import_hook_count);
             write_supervisor_state(
                 "active", game_pid, session,
@@ -772,6 +876,11 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
         }
         loop_count++;
         if ((loop_count % 120u) == 0) {
+            PoorDS4RemoteReaderStatus reader_status;
+            memset(&reader_status, 0, sizeof(reader_status));
+            if (wireless_ds4_remote_reader_status(
+                    reader_pid, reader_args, &reader_status) == 0)
+                last_reader_status = reader_status;
             errno = 0;
             game_alive = kill(game_pid, 0) == 0 || errno == EPERM;
             /* Never copy from a PID once kill(2) says it is gone. RC22 did
@@ -1115,6 +1224,7 @@ main(void)
 
     pid_t launch_candidate_pid = -1;
     uint64_t launch_candidate_since_ms = 0;
+    uint64_t last_waiting_source_log_ms = 0;
     for (;;) {
         if (lifecycle_should_stop())
             break;
@@ -1143,12 +1253,20 @@ main(void)
             poords4_log(
                 "[PoorDS4] restoring wireless reader before game scan "
                 "pid=%d args=0x%lx snapshot=%d ready=%d stop=%d "
-                "result=0x%08x connected=%u\n",
+                "result=0x%08x connected=%u mode=%u "
+                "queued=0x%08x queued_ok=%u empty=%u errors=%u "
+                "state_fallback=%u\n",
                 reader_pid, (unsigned long)reader_args,
                 reader_preflight_result, reader_preflight.ready,
                 reader_preflight.stop,
                 (uint32_t)reader_preflight.last_result,
-                (unsigned)reader_preflight.connected);
+                (unsigned)reader_preflight.connected,
+                reader_preflight.reader_mode,
+                (uint32_t)reader_preflight.last_read_result,
+                reader_preflight.read_success_frames,
+                reader_preflight.read_empty_frames,
+                reader_preflight.read_error_frames,
+                reader_preflight.state_fallback_frames);
             if (reader_pid > 0 && reader_args != 0 &&
                 process_alive(reader_pid)) {
                 int stop_result = wireless_ds4_remote_reader_stop(
@@ -1186,6 +1304,33 @@ main(void)
             game_bridge_notify(
                 "PoorDS4: wireless DS4 restored; waiting for a PS5 game");
             continue;
+        }
+
+        {
+            uint64_t now = monotonic_milliseconds();
+            if (last_waiting_source_log_ms == 0 ||
+                (now != 0 && now >= last_waiting_source_log_ms + 10000u)) {
+                poords4_log(
+                    "[PoorDS4] SOURCE HEALTH waiting seq=%u conn=%u "
+                    "buttons=0x%08x sticks=%u,%u,%u,%u triggers=%u,%u "
+                    "timestamp=%llu count=%u mode=%u queued=0x%08x "
+                    "queued_ok=%u empty=%u errors=%u state_fallback=%u\n",
+                    reader_preflight.seq,
+                    (unsigned)reader_preflight.connected,
+                    reader_preflight.buttons,
+                    reader_preflight.left_x, reader_preflight.left_y,
+                    reader_preflight.right_x, reader_preflight.right_y,
+                    reader_preflight.left_trigger,
+                    reader_preflight.right_trigger,
+                    (unsigned long long)reader_preflight.timestamp,
+                    reader_preflight.count, reader_preflight.reader_mode,
+                    (uint32_t)reader_preflight.last_read_result,
+                    reader_preflight.read_success_frames,
+                    reader_preflight.read_empty_frames,
+                    reader_preflight.read_error_frames,
+                    reader_preflight.state_fallback_frames);
+                last_waiting_source_log_ms = now ? now : 1;
+            }
         }
 
         pid_t observed_game_pid = -1;

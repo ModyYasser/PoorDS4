@@ -3,6 +3,101 @@
 All notable changes to this project are documented here. Release tags follow
 Semantic Versioning; wireless-bridge candidates use `0.1.0-rcN`.
 
+## [0.1.0-rc43] - 2026-09-17
+
+### Added
+
+- Support for FW 6.02 (`0x06020004`) and FW 10.01 (`0x10010000`) exact manifests
+  and fingerprint hashes alongside existing FW 8.60, 11.60, and 12.40 manifests.
+- Dynamic table stride and span discovery: scan code immediates in `libScePad`
+  for both `0x548`/`0x7ec0` (FW 6.02) and `0x5c8`/`0x8ac0` (FW 8.60 - 12.40+),
+  enabling cross-firmware execution across older and newer kernels without hardcoding.
+- Universal controller connection order & multi-controller slot selection hierarchy:
+  support DS4 connected as Player 1, Player 2, or any slot combination by matching
+  inactive pad entries bound to the source user (`source-user-inactive-unique`,
+  `source-user-index-inactive`, `source-user-index-inactive-unique`, `global-inactive-unique`,
+  `global-index-inactive-unique`), cleanly handling games like EA Sports FC 26 and
+  Pragmata that preallocate multi-controller tables.
+
+### Verification
+
+- Live hardware verified on physical PS5 (Model CFI-2016 B01Y, FW 11.600.005)
+  across 4 consecutive native PS5 games:
+  - Greak (`PPSA02849`): 1 slot, 2 import hooks, 3,180 frames, clean exit.
+  - Pragmata (`PPSA02530`): 2 slots preallocated, selected slot 0, 1,320 frames, clean exit.
+  - JoJo's Bizarre Adventure (`PPSA04220`): 1 slot, 2 import hooks, 4,080 frames, clean exit.
+  - EA Sports FC 26 (`PPSA27360`): 3 import hooks, 3,360 frames, clean exit.
+- Verified zero errors, zero stale reads, zero frame drops, and clean multi-game
+  lifecycle recovery (`abandon-dead result=0`).
+
+## [0.1.0-rc42] - 2026-08-11
+
+### Fixed
+
+- Prefer Sony's queued `scePadRead` source API inside RemotePlay and fall back
+  to `scePadReadState` only when no queued frame is available. The supplied
+  8.60 run proved that the main-thread state probe could see a connected DS4,
+  but RC39 never proved that its secondary-thread state cache carried input.
+  This adaptive public-API path avoids firmware-private Bluetooth offsets.
+
+- Establish RemotePlay's process-local login-user and pad-focus context before
+  opening the physical DS4. RC39 could open and identify a live 8.60 handle
+  without proving that its stream contained user input.
+- Preserve a connected frame returned by the game's own Sony read path and use
+  RemotePlay only when that backing path is disconnected or fails. This avoids
+  replacing firmware-local input with an idle fallback stream.
+- Preserve plausible firmware-native controller geometry, deadzones, and
+  connection metadata. Only missing metadata and the compatibility fields are
+  repaired, so 8.60's observed 1920x1080 layout is not rewritten to later
+  firmware defaults.
+
+- Replace the compiler-specific pad-client locator with bounded
+  RIP-relative discovery. A candidate is accepted only when its live table
+  has one exact source `(user ID, pad index)` identity, so alternate register
+  allocation cannot break 8.60 while ambiguous layouts still fail closed.
+- Treat a missing executable mapping as a bounded readiness wait when every
+  exact-manifest and non-mapping ABI check already passed. The new 8.60 logs
+  showed one transient protection snapshot turning an otherwise retryable
+  launch into a permanent PID skip.
+- Complete relocation scans across mixed kernel/target metadata, including
+  kernel-page-boundary NIDs. Unreadable names are accepted only when the slot
+  matches an exact pad export or its target belongs to a loaded module;
+  unproven and partial hook inventories fail closed.
+
+### Diagnostics
+
+- Extend firmware reports to schema 8 with source-context symbol/results,
+  transition-level button/stick/trigger state, source timestamps, and explicit
+  native-versus-fallback game-path counters. Schema 8 also records the
+  original-thread queued-read probe and worker queued/state path counters.
+- Capture the successful game-local Sony read before translation, including
+  its connected flag, controls, timestamp, and activity count. This separates
+  a firmware that exposes usable native DS4 data from one that returns a
+  successful but entirely neutral backing frame.
+- Retain the schema 6 internal reader prefix,
+  RIP-relative candidates, source-user memory contexts, raw VM protections,
+  and libScePad section mappings. A rejected firmware now records enough
+  bounded evidence to distinguish code-shape, data-layout, and mapping races.
+
+### Verification
+
+- The new locator installed live on 11.60, selected the same two-entry game
+  table by the exact source identity, and published translated frames without
+  weakening the existing exact or structural admission gates.
+- An 8.60 RC39 hardware run passed exact admission, selected one uniquely
+  source-bound client table, installed two eboot imports, and published 2,400
+  frames with zero transport failures, but the tester confirmed that input did
+  not work. RC40 therefore treats hook/packet health as insufficient and awaits
+  a real button-transition plus gameplay test on 8.60.
+- RC41 passed a live 11.60 regression: RemotePlay setup completed safely, real
+  button and full-range stick/trigger transitions were recorded, the existing
+  fallback path remained active, and bridge health stayed failure-free. The
+  captured Sony frame returned success but remained disconnected, centered,
+  and timestamp-zero, proving that RemotePlay cannot be removed on 11.60.
+- RC42 keeps the RC41 game bridge and adds the queued source path specifically
+  for the remaining 8.60 failure. It requires a real 8.60 input test before a
+  public compatibility claim.
+
 ## [0.1.0-rc38] - 2026-08-09
 
 ### Fixed

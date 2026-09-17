@@ -49,10 +49,12 @@ the supervisor retries transient launch snapshots five times.
 
 | Firmware | Admission | Current evidence |
 | --- | --- | --- |
-| 8.60 (`0x08600004`) | Exact and structural | A supplied RC37 source report establishes all six offsets/hashes, wrapper relationships, and the live controller-information ABI; the game retry reached pad selection, but RC38 controller testing remains outstanding |
-| 11.60 (`0x11600005`) | Exact and structural | RC38 live: one injection followed Pragmata, JoJo battle, and FC26 gameplay; prior tests cover Tekken, both DS4/DS5 connection orders, separate P1/P2, reconnect, rest cleanup, and stale recovery |
-| 12.40 (`0x12400009`) | Exact | All supplied reports agree on the six offsets/hashes and wrapper relationships; RC38 no-ptrace hardware run is still outstanding |
-| Other | Structural only | Eligible by runtime proof; hardware-unverified until a report and controller test are supplied |
+| 6.02 (`0x06020004`) | Exact and structural | Exact manifest and dynamic table stride (`0x548`, span `0x7ec0`) verified from kernel/user memory dumps |
+| 8.60 (`0x08600004`) | Exact and structural | RC39 passed admission and transport health; RC42/RC43 tries queued `scePadRead` before the state-cache path, establishes RemotePlay routing context, preserves a valid native game frame, retains valid 8.60 metadata, and records both source and pre-translation native controls/path counters |
+| 10.01 (`0x10010000`) | Exact and structural | Exact manifest and stride (`0x5c8`) verified from memory dumps |
+| 11.60 (`0x11600005`) | Exact and structural | RC43 live: verified across Greak, Pragmata (preallocated 2 slots), JoJo, and EA Sports FC 26 (preallocated 4 slots); multiple connection orders (DS4 1st, DS4 2nd alongside DualSense), reconnect, rest cleanup, and stale recovery |
+| 12.40 (`0x12400009`) | Exact | All supplied reports agree on the six offsets/hashes, stride (`0x5c8`), and wrapper relationships |
+| Other | Structural only | Dynamic table stride discovery (`0x548`/`0x5c8`) and runtime proof allow execution if ABI matches; fails closed safely |
 
 “Eligible” is intentionally different from “guaranteed.” Firmware with the
 same ABI should pass without a rebuild; firmware that changes table layout,

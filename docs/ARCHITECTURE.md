@@ -8,6 +8,17 @@ DS4, validates one controller-information result, then starts a small reader
 thread owned by RemotePlay. The reader publishes 120-byte `ScePadData`
 snapshots and exits if its owning payload disappears.
 
+The reader prefers the public queued `scePadRead(handle, frame, 1)` path and
+uses `scePadReadState` only when the queue is empty or unavailable. This keeps
+the verified later-firmware state path while avoiding an idle secondary-thread
+state cache on older libScePad revisions. Both raw results and path counters
+are included in the normal health log and status report.
+
+Before opening the pad, the stopped RemotePlay main thread receives process
+privilege, login-user count, and focus setup through resolved public exports.
+Their addresses and return values are recorded; the injected reader thread
+does not perform setup IPC concurrently with RemotePlay.
+
 Controller discovery scans all candidate users and pad indices. A live state
 sample alone is never treated as proof of DS4 identity: public VID/PID data,
 `scePadIsDS4Connected`, or the exact 11.60 identity table must confirm it.
@@ -42,9 +53,11 @@ code page, Sony library code, heap allocation, thread, or socket is modified.
 
 The supervisor writes the inactive 120-byte frame, then atomically publishes
 its sequence, finite lease, active flag, and packet count. Each gateway either
-returns a stable translated snapshot for the selected handle or immediately
-falls through to the saved Sony function. Non-selected handles always use the
-original path.
+preserves a connected frame returned by the saved Sony function or uses a
+stable RemotePlay snapshot when the native backing path is disconnected or
+fails. Non-selected handles always use the original path. Controller metadata
+keeps plausible native geometry and deadzones; only missing values and the
+connected standard-controller compatibility fields are repaired.
 
 ## Player selection
 

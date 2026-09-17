@@ -16,8 +16,8 @@ $bridge = [IO.File]::ReadAllText(
 $makefile = [IO.File]::ReadAllText(
     (Join-Path $repo 'payload\Makefile'))
 
-Assert-True ($makefile.Contains('RC_VERSION := 38')) `
-    'Makefile RC version is not 38.'
+Assert-True ($makefile.Contains('RC_VERSION := 43')) `
+    'Makefile RC version is not 43.'
 Assert-True (-not $makefile.Contains('-lScePad')) `
     'Build still links libScePad despite using runtime-resolved game exports.'
 Assert-True (-not $makefile.Contains('-lpthread')) `
@@ -96,10 +96,46 @@ Assert-True ($bridge.Contains(
 Assert-True ($bridge.Contains(
     'active_count == 1u && identity_count == 1u')) `
     'Sole active fallback is not bound to the source controller identity.'
-Assert-True ($bridge.Contains('poords4_rc=%d\nreport_schema=5')) `
+Assert-True ($bridge.Contains('poords4_rc=%d\nreport_schema=8')) `
     'Firmware reports do not identify their RC and schema.'
+Assert-True ($bridge.Contains('client_locator_summary')) `
+    'Cross-firmware client-table locator diagnostics are missing.'
+Assert-True ($bridge.Contains('client_user_scan')) `
+    'Rejected table layouts do not report bounded source-user evidence.'
+Assert-True ($bridge.Contains('target_protection state=')) `
+    'Rejected executable mappings do not report raw protections.'
+Assert-True ($bridge.Contains('waiting_for_executable_mapping')) `
+    'Exact-manifest executable mapping races are still permanent skips.'
+Assert-True ($bridge.Contains('libpad_section index=')) `
+    'Firmware reports do not include bounded libScePad section mappings.'
+Assert-True ($bridge.Contains(
+    'stale_recovery_error=import_scan')) `
+    'Incomplete import discovery does not fail closed before installation.'
+Assert-True ($bridge.Contains(
+    'import_scan_error=no_supported_hooks')) `
+    'Games without supported pad imports are not diagnosed fail closed.'
+Assert-True ($bridge.Contains('reason=known-module-target')) `
+    'Unreadable import names are not bounded by loaded-module ownership.'
 Assert-True ($bridge.Contains('source_library_match')) `
     'Same-firmware source/game libScePad comparison is missing.'
+Assert-True ($bridge.Contains('scePadSetLoginUserNumber')) `
+    'RemotePlay login-user context setup is missing.'
+Assert-True ($bridge.Contains('scePadSetProcessFocus')) `
+    'RemotePlay focus setup is missing.'
+Assert-True ($bridge.Contains('queued_result = read_events(')) `
+    'Adaptive queued source read is missing.'
+Assert-True ($bridge.Contains('state_fallback_frames')) `
+    'Queued/state source path diagnostics are missing.'
+Assert-True (-not $bridge.Contains('scePadSetUserNumber')) `
+    'Rejected, profile-sensitive user-number setup is still present.'
+Assert-True ($bridge.Contains('native_passthrough_frames')) `
+    'Native connected-frame preservation is missing.'
+Assert-True ($bridge.Contains('direct_fallback_frames')) `
+    'Disconnected native-path fallback diagnostics are missing.'
+Assert-True ($bridge.Contains('native_input_activity_frames')) `
+    'Pre-translation native input diagnostics are missing.'
+Assert-True ($bridge.Contains('touch_x == 0 || touch_x > 8192u')) `
+    'Controller metadata no longer preserves plausible firmware geometry.'
 Assert-True (-not $bridge.Contains('game_pad_bridge_receiver_stub')) `
     'Retired injected game receiver is present.'
 Assert-True (-not $bridge.Contains('wireless_ds4_game_bridge_run(')) `

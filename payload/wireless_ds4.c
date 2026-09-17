@@ -42,7 +42,9 @@
 extern void poords4_log(const char *format, ...);
 #define klog_printf poords4_log
 #define POORDS4_REMOTE_PAD_CAPACITY 256u
+#define POORDS4_GAME_BRIDGE_FW_0602 UINT32_C(0x06020004)
 #define POORDS4_GAME_BRIDGE_FW_0860 UINT32_C(0x08600004)
+#define POORDS4_GAME_BRIDGE_FW_1001 UINT32_C(0x10010000)
 #define POORDS4_GAME_BRIDGE_FW_1160 UINT32_C(0x11600005)
 #define POORDS4_GAME_BRIDGE_FW_1240 UINT32_C(0x12400009)
 #define POORDS4_KEKCALL_REMOTE_SYSCALL UINT64_C(0x500000027)
@@ -163,9 +165,12 @@ done:
     return result;
 }
 
-/* libScePad's private client-table layout verified from firmware 11.60. */
+/* libScePad's private client-table layout verified across firmwares 6.02 - 12.40+. */
 #define POORDS4_PAD_CLIENT_TABLE_1160 UINT32_C(0x00020018)
+#define POORDS4_PAD_CLIENT_STRIDE_0602 UINT32_C(0x00000548)
+#define POORDS4_PAD_CLIENT_SPAN_0602   UINT32_C(0x00007ec0)
 #define POORDS4_PAD_CLIENT_STRIDE_1160 UINT32_C(0x000005c8)
+#define POORDS4_PAD_CLIENT_SPAN_1160   UINT32_C(0x00008ac0)
 #define POORDS4_PAD_CLIENT_CONNECTED_1160 UINT32_C(0x18)
 #define POORDS4_PAD_CLIENT_HANDLE_1160 UINT32_C(0x1c)
 #define POORDS4_PAD_CLIENT_USER_ID_1160 UINT32_C(0x24)
@@ -173,7 +178,10 @@ done:
 #define POORDS4_PAD_CLIENT_PRODUCT_1160 UINT32_C(0x62)
 
 static void report_printf(int fd, const char *format, ...);
-static int remote_pad_identity_1160(
+static int remote_pad_identity(
+    pid_t pid, intptr_t libpad_base, int32_t pad_handle,
+    int32_t *out_connected, uint16_t *out_vendor, uint16_t *out_product);
+static int __attribute__((unused)) remote_pad_identity_1160(
     pid_t pid, intptr_t libpad_base, int32_t pad_handle,
     int32_t *out_connected, uint16_t *out_vendor, uint16_t *out_product);
 static int remote_pad_is_known_ds4(
@@ -565,11 +573,20 @@ typedef struct {
     volatile uint32_t owner_miss_count;
     volatile uint32_t owner_watchdog_exits;
     uint32_t reserved;
+    /* Appended source ABI: older firmware can expose a live pad through the
+     * queued read path while a secondary thread's state cache remains idle. */
+    intptr_t fp_read;
+    volatile int32_t last_read_result;
+    volatile uint32_t read_success_frames;
+    volatile uint32_t read_empty_frames;
+    volatile uint32_t read_error_frames;
+    volatile uint32_t state_fallback_frames;
+    volatile uint32_t reader_mode; /* 1=state, 2=queued read */
 } RemotePadReaderArgs;
 
 _Static_assert(sizeof(ScePadData) == 120,
                "ScePadData ABI changed");
-_Static_assert(sizeof(RemotePadReaderArgs) == 336,
+_Static_assert(sizeof(RemotePadReaderArgs) == 368,
                "RemotePadReaderArgs ABI changed");
 
 extern void *remote_pad_reader_stub(void *arg);
@@ -586,10 +603,13 @@ remote_pad_reader_stub(void *arg)
 {
     RemotePadReaderArgs *a = (RemotePadReaderArgs *)arg;
     typedef int32_t (*read_fn_t)(int32_t, void *);
+    typedef int32_t (*read_events_fn_t)(int32_t, void *, int32_t);
     typedef void (*usleep_fn_t)(unsigned int);
     typedef int32_t (*kill_fn_t)(int32_t, int32_t);
     typedef int32_t (*close_pad_fn_t)(int32_t);
     read_fn_t readstate = (read_fn_t)(uintptr_t)a->fp_readstate;
+    read_events_fn_t read_events =
+        (read_events_fn_t)(uintptr_t)a->fp_read;
     usleep_fn_t sleep_us = (usleep_fn_t)(uintptr_t)a->fp_usleep;
     kill_fn_t check_owner = (kill_fn_t)(uintptr_t)a->fp_kill;
     close_pad_fn_t close_pad =
@@ -601,7 +621,40 @@ remote_pad_reader_stub(void *arg)
         uint32_t odd =
             (__atomic_load_n(&a->seq, __ATOMIC_RELAXED) + 1u) | 1u;
         __atomic_store_n(&a->seq, odd, __ATOMIC_RELEASE);
-        int32_t result = readstate(a->pad_handle, a->pad_data);
+        int32_t result = -1;
+        int32_t queued_result = -1;
+        if (read_events) {
+            queued_result = read_events(
+                a->pad_handle, a->pad_data, 1);
+            __atomic_store_n(
+                &a->last_read_result, queued_result,
+                __ATOMIC_RELAXED);
+            if (queued_result > 0) {
+                result = 0;
+                __atomic_store_n(
+                    &a->reader_mode, 2, __ATOMIC_RELAXED);
+                (void)__atomic_fetch_add(
+                    &a->read_success_frames, 1,
+                    __ATOMIC_RELAXED);
+            } else {
+                if (queued_result == 0)
+                    (void)__atomic_fetch_add(
+                        &a->read_empty_frames, 1,
+                        __ATOMIC_RELAXED);
+                else
+                    (void)__atomic_fetch_add(
+                        &a->read_error_frames, 1,
+                        __ATOMIC_RELAXED);
+            }
+        }
+        if (queued_result <= 0) {
+            result = readstate(a->pad_handle, a->pad_data);
+            __atomic_store_n(
+                &a->reader_mode, 1, __ATOMIC_RELAXED);
+            (void)__atomic_fetch_add(
+                &a->state_fallback_frames, 1,
+                __ATOMIC_RELAXED);
+        }
         __atomic_store_n(&a->last_result, result, __ATOMIC_RELAXED);
         __atomic_store_n(&a->seq, odd + 1u, __ATOMIC_RELEASE);
         sleep_us(a->interval_us);
@@ -728,11 +781,32 @@ typedef struct {
     volatile uint32_t direct_active;
     volatile uint32_t direct_packets;
     uint8_t direct_pad_data[2][POORDS4_GAME_BRIDGE_PAD_SIZE];
+    /* RC40 path diagnostics. A connected native game frame is always
+     * authoritative. RemotePlay is the fallback only when Sony's game-local
+     * path reports the backing slot disconnected or returns an error. */
+    volatile uint64_t native_passthrough_frames;
+    volatile uint64_t native_connected_frames;
+    volatile uint64_t direct_fallback_frames;
+    volatile uint64_t direct_active_fallbacks;
+    volatile int32_t last_native_result;
+    uint32_t path_reserved;
+    volatile uint64_t native_success_frames;
+    volatile uint64_t native_input_activity_frames;
+    volatile uint64_t last_native_timestamp;
+    volatile uint32_t last_native_buttons;
+    volatile uint8_t last_native_lx;
+    volatile uint8_t last_native_ly;
+    volatile uint8_t last_native_rx;
+    volatile uint8_t last_native_ry;
+    volatile uint8_t last_native_l2;
+    volatile uint8_t last_native_r2;
+    volatile uint8_t last_native_connected;
+    volatile uint8_t last_native_count;
 } GamePadBridgeArgs;
 
 _Static_assert(offsetof(GamePadBridgeArgs, legacy_fp_setsockopt) == 496,
                "PoorDS4 bridge ABI v1 prefix changed");
-_Static_assert(sizeof(GamePadBridgeArgs) == 2872,
+_Static_assert(sizeof(GamePadBridgeArgs) == 2952,
                "GamePadBridgeArgs ABI changed");
 
 static pid_t g_game_bridge_direct_pid = -1;
@@ -831,6 +905,68 @@ game_bridge_copy_direct(GamePadBridgeArgs *args, void *out,
     return 1;
 }
 
+static __attribute__((always_inline)) inline int
+game_bridge_direct_controls_active(GamePadBridgeArgs *args)
+{
+    uint32_t sequence = __atomic_load_n(
+        &args->direct_seq, __ATOMIC_ACQUIRE);
+    volatile uint8_t *pad =
+        args->direct_pad_data[sequence & 1u];
+    uint32_t buttons = (uint32_t)pad[0] |
+        ((uint32_t)pad[1] << 8u) |
+        ((uint32_t)pad[2] << 16u) |
+        ((uint32_t)pad[3] << 24u);
+    if (buttons != 0 || pad[8] != 0 || pad[9] != 0)
+        return 1;
+    /* Raw stick centers differ by controller and drift naturally. Meaningful
+     * axis transitions are diagnosed by the supervisor, while this counter is
+     * deliberately limited to unambiguous buttons/triggers. */
+    return 0;
+}
+
+static __attribute__((always_inline)) inline int
+game_bridge_native_connected(void *out)
+{
+    return ((volatile uint8_t *)out)[offsetof(ScePadData, connected)] != 0;
+}
+
+static __attribute__((always_inline)) inline void
+game_bridge_record_native(GamePadBridgeArgs *args, void *out)
+{
+    volatile ScePadData *pad = (volatile ScePadData *)out;
+    (void)__atomic_fetch_add(
+        &args->native_success_frames, 1, __ATOMIC_RELAXED);
+    int active = pad->buttons != 0 ||
+        pad->analogButtons.l2 != 0 || pad->analogButtons.r2 != 0 ||
+        pad->leftStick.x < 96 || pad->leftStick.x > 160 ||
+        pad->leftStick.y < 96 || pad->leftStick.y > 160 ||
+        pad->rightStick.x < 96 || pad->rightStick.x > 160 ||
+        pad->rightStick.y < 96 || pad->rightStick.y > 160;
+    if (active)
+        (void)__atomic_fetch_add(
+            &args->native_input_activity_frames, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(
+        &args->last_native_timestamp, pad->timestamp, __ATOMIC_RELAXED);
+    __atomic_store_n(
+        &args->last_native_buttons, pad->buttons, __ATOMIC_RELAXED);
+    __atomic_store_n(&args->last_native_lx, pad->leftStick.x,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&args->last_native_ly, pad->leftStick.y,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&args->last_native_rx, pad->rightStick.x,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&args->last_native_ry, pad->rightStick.y,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&args->last_native_l2, pad->analogButtons.l2,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&args->last_native_r2, pad->analogButtons.r2,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&args->last_native_connected, pad->connected,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&args->last_native_count, pad->count,
+                     __ATOMIC_RELAXED);
+}
+
 __attribute__((noinline, used, section(".text.ds4gamebridge")))
 int32_t
 game_pad_read_state_stub(int32_t handle, void *out,
@@ -856,6 +992,28 @@ game_pad_read_state_stub(int32_t handle, void *out,
                     &args->native_backing_errors, 1,
                     __ATOMIC_RELAXED);
         }
+        __atomic_store_n(
+            &args->last_native_result, native_result, __ATOMIC_RELAXED);
+        if (native_called && native_result == 0)
+            game_bridge_record_native(args, out);
+        int native_connected = native_result == 0 &&
+            game_bridge_native_connected(out);
+        int direct_active = game_bridge_direct_controls_active(args);
+        if (native_connected)
+            (void)__atomic_fetch_add(
+                &args->native_connected_frames, 1, __ATOMIC_RELAXED);
+        if (native_connected) {
+            (void)__atomic_fetch_add(
+                &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
+            (void)__atomic_fetch_add(
+                &args->read_state_calls, 1, __ATOMIC_RELAXED);
+            return native_result;
+        }
+        (void)__atomic_fetch_add(
+            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+        if (direct_active)
+            (void)__atomic_fetch_add(
+                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
         if (game_bridge_copy_direct(
                 args, out, &args->read_state_calls))
             return 0;
@@ -892,6 +1050,28 @@ game_pad_read_state_ext_stub(int32_t handle, void *out,
                     &args->native_backing_errors, 1,
                     __ATOMIC_RELAXED);
         }
+        __atomic_store_n(
+            &args->last_native_result, native_result, __ATOMIC_RELAXED);
+        if (native_called && native_result == 0)
+            game_bridge_record_native(args, out);
+        int native_connected = native_result == 0 &&
+            game_bridge_native_connected(out);
+        int direct_active = game_bridge_direct_controls_active(args);
+        if (native_connected)
+            (void)__atomic_fetch_add(
+                &args->native_connected_frames, 1, __ATOMIC_RELAXED);
+        if (native_connected) {
+            (void)__atomic_fetch_add(
+                &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
+            (void)__atomic_fetch_add(
+                &args->read_state_ext_calls, 1, __ATOMIC_RELAXED);
+            return native_result;
+        }
+        (void)__atomic_fetch_add(
+            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+        if (direct_active)
+            (void)__atomic_fetch_add(
+                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
         if (game_bridge_copy_direct(
                 args, out, &args->read_state_ext_calls))
             return 0;
@@ -928,6 +1108,28 @@ game_pad_read_stub(int32_t handle, void *out, int32_t num,
                     &args->native_backing_errors, 1,
                     __ATOMIC_RELAXED);
         }
+        __atomic_store_n(
+            &args->last_native_result, native_result, __ATOMIC_RELAXED);
+        if (native_called && native_result > 0)
+            game_bridge_record_native(args, out);
+        int native_connected = native_result > 0 &&
+            game_bridge_native_connected(out);
+        int direct_active = game_bridge_direct_controls_active(args);
+        if (native_connected)
+            (void)__atomic_fetch_add(
+                &args->native_connected_frames, 1, __ATOMIC_RELAXED);
+        if (native_connected) {
+            (void)__atomic_fetch_add(
+                &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
+            (void)__atomic_fetch_add(
+                &args->read_calls, 1, __ATOMIC_RELAXED);
+            return native_result;
+        }
+        (void)__atomic_fetch_add(
+            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+        if (direct_active)
+            (void)__atomic_fetch_add(
+                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
         if (game_bridge_copy_direct(
                 args, out, &args->read_calls))
             return 1;
@@ -964,6 +1166,28 @@ game_pad_read_ext_stub(int32_t handle, void *out, int32_t num,
                     &args->native_backing_errors, 1,
                     __ATOMIC_RELAXED);
         }
+        __atomic_store_n(
+            &args->last_native_result, native_result, __ATOMIC_RELAXED);
+        if (native_called && native_result > 0)
+            game_bridge_record_native(args, out);
+        int native_connected = native_result > 0 &&
+            game_bridge_native_connected(out);
+        int direct_active = game_bridge_direct_controls_active(args);
+        if (native_connected)
+            (void)__atomic_fetch_add(
+                &args->native_connected_frames, 1, __ATOMIC_RELAXED);
+        if (native_connected) {
+            (void)__atomic_fetch_add(
+                &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
+            (void)__atomic_fetch_add(
+                &args->read_ext_calls, 1, __ATOMIC_RELAXED);
+            return native_result;
+        }
+        (void)__atomic_fetch_add(
+            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+        if (direct_active)
+            (void)__atomic_fetch_add(
+                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
         if (game_bridge_copy_direct(
                 args, out, &args->read_ext_calls))
             return 1;
@@ -1000,6 +1224,28 @@ game_pad_get_data_internal_stub(int32_t handle, void *out,
                     &args->native_backing_errors, 1,
                     __ATOMIC_RELAXED);
         }
+        __atomic_store_n(
+            &args->last_native_result, native_result, __ATOMIC_RELAXED);
+        if (native_called && native_result == 0)
+            game_bridge_record_native(args, out);
+        int native_connected = native_result == 0 &&
+            game_bridge_native_connected(out);
+        int direct_active = game_bridge_direct_controls_active(args);
+        if (native_connected)
+            (void)__atomic_fetch_add(
+                &args->native_connected_frames, 1, __ATOMIC_RELAXED);
+        if (native_connected) {
+            (void)__atomic_fetch_add(
+                &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
+            (void)__atomic_fetch_add(
+                &args->data_internal_calls, 1, __ATOMIC_RELAXED);
+            return native_result;
+        }
+        (void)__atomic_fetch_add(
+            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+        if (direct_active)
+            (void)__atomic_fetch_add(
+                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
         if (game_bridge_copy_direct(
                 args, out, &args->data_internal_calls))
             return 0;
@@ -1047,18 +1293,30 @@ game_pad_get_controller_info_stub(int32_t handle, void *out,
         game_bridge_handle_matches(args, handle) && out &&
         game_bridge_direct_available(args)) {
         volatile uint8_t *info = (volatile uint8_t *)out;
-        /* 1.0f pixels/mm-ish density; DS4 native 1920x943 touch range. */
-        info[0] = 0x00;
-        info[1] = 0x00;
-        info[2] = 0x80;
-        info[3] = 0x3f;
-        info[4] = 0x80;
-        info[5] = 0x07;
-        info[6] = 0xaf;
-        info[7] = 0x03;
-        info[8] = 2;
-        info[9] = 2;
-        info[10] = 0; /* local controller */
+        uint16_t touch_x = (uint16_t)info[4] |
+            ((uint16_t)info[5] << 8u);
+        uint16_t touch_y = (uint16_t)info[6] |
+            ((uint16_t)info[7] << 8u);
+        /* Preserve a successful firmware-native metadata prefix. This matters
+         * on 8.60, whose live controller reports 1920x1080 rather than the
+         * later build's geometry. Fill only when Sony returned no plausible
+         * geometry for the disconnected backing slot. */
+        if (result != 0 || touch_x == 0 || touch_x > 8192u ||
+            touch_y == 0 || touch_y > 8192u) {
+            info[0] = 0x00;
+            info[1] = 0x00;
+            info[2] = 0x80;
+            info[3] = 0x3f;
+            info[4] = 0x80;
+            info[5] = 0x07;
+            info[6] = 0xaf;
+            info[7] = 0x03;
+            info[8] = 13;
+            info[9] = 13;
+            info[10] = 0;
+            for (unsigned byte = 20; byte < 28; ++byte)
+                info[byte] = 0;
+        }
         info[11] = 1;
         info[12] = 1;
         info[13] = 0;
@@ -1068,8 +1326,6 @@ game_pad_get_controller_info_stub(int32_t handle, void *out,
         info[17] = 0;
         info[18] = 0;
         info[19] = 0;
-        for (unsigned byte = 20; byte < 28; ++byte)
-            info[byte] = 0;
         (void)__atomic_fetch_add(
             &args->controller_info_spoofs, 1, __ATOMIC_RELAXED);
         if (result != 0)
@@ -1529,6 +1785,10 @@ wireless_ds4_remote_reader_start(
             target, libpad_h, "scePadGetControllerInformation") : 0;
     intptr_t fn_setpriv = libpad_h
         ? resolve_sym(target, libpad_h, "scePadSetProcessPrivilege") : 0;
+    intptr_t fn_setloginuser = libpad_h
+        ? resolve_sym(target, libpad_h, "scePadSetLoginUserNumber") : 0;
+    intptr_t fn_setfocus = libpad_h
+        ? resolve_sym(target, libpad_h, "scePadSetProcessFocus") : 0;
     intptr_t fn_usleep = libkernel_h
         ? resolve_sym(target, libkernel_h, "usleep") : 0;
     intptr_t fn_pthread_create = libkernel_h
@@ -1573,13 +1833,15 @@ wireless_ds4_remote_reader_start(
                 "close=0x%lx isds4=0x%lx deviceid=0x%lx "
                 "deviceinfo=0x%lx "
                 "read=0x%lx sleep=0x%lx pthread=0x%lx detach=0x%lx "
-                "kill=0x%lx malloc=0x%lx "
+                "kill=0x%lx malloc=0x%lx setpriv=0x%lx "
+                "setlogin=0x%lx setfocus=0x%lx "
                 "trap=0x%lx base=0x%lx fw=0x%08x\n",
                 fn_gethandle, fn_open, fn_closepad, fn_isds4,
                 fn_getdeviceid, fn_getdeviceinfo,
                 fn_readstate, fn_usleep,
                 fn_pthread_create, fn_pthread_detach, fn_kill,
-                fn_malloc, trap_mem,
+                fn_malloc, fn_setpriv, fn_setloginuser,
+                fn_setfocus, trap_mem,
                 libpad_base, firmware);
     {
         (void)mkdir("/data/poords4/reports", 0755);
@@ -1597,7 +1859,7 @@ wireless_ds4_remote_reader_start(
             report_printf(
                 source_report_fd,
                 "mode=read-only-source-libpad-fingerprint\n"
-                "poords4_rc=%d\nreport_schema=5\n"
+                "poords4_rc=%d\nreport_schema=8\n"
                 "firmware=0x%08x\npid=%d\nlibpad_base=0x%lx\n",
                 POORDS4_RC_VERSION, firmware, target,
                 (unsigned long)libpad_base);
@@ -1652,11 +1914,55 @@ wireless_ds4_remote_reader_start(
             goto cleanup;
     }
 
-    if (fn_setpriv) {
-        int64_t result = pt_call(target, fn_setpriv, trap_mem,
+    int64_t setpriv_result = INT64_MIN;
+    int64_t setlogin_result = INT64_MIN;
+    int64_t setfocus_result = INT64_MIN;
+    if (fn_setpriv)
+        setpriv_result = pt_call(target, fn_setpriv, trap_mem,
                                  1, 0, 0, 0, 0, 0);
-        klog_printf("[PoorDS4] reader setpriv=0x%llx\n",
-                    (unsigned long long)(uint64_t)result);
+    /* Older libScePad revisions do not necessarily give a privileged client
+     * input focus merely because scePadOpen succeeds. Ghostpad's recovered
+     * client setup establishes all three process-local routing values before
+     * opening a pad. Perform the calls on RemotePlay's stopped main thread,
+     * never concurrently from the injected reader thread. These calls select
+     * one already logged-in user context; they do not create a virtual pad or
+     * display the controller-assignment UI. */
+    if (fn_setloginuser)
+        setlogin_result = pt_call(target, fn_setloginuser, trap_mem,
+                                  1, 0, 0, 0, 0, 0);
+    if (fn_setfocus)
+        setfocus_result = pt_call(target, fn_setfocus, trap_mem,
+                                  1, 0, 0, 0, 0, 0);
+    klog_printf(
+        "[PoorDS4] reader context fw=0x%08x privilege=0x%llx "
+        "login_user=0x%llx focus=0x%llx\n",
+        firmware,
+        (unsigned long long)(uint64_t)setpriv_result,
+        (unsigned long long)(uint64_t)setlogin_result,
+        (unsigned long long)(uint64_t)setfocus_result);
+    {
+        char source_report_path[160];
+        int path_length = snprintf(
+            source_report_path, sizeof(source_report_path),
+            "/data/poords4/reports/source-fw-%08x-pid-%d.txt",
+            firmware, target);
+        int source_report_fd = path_length > 0 &&
+            (size_t)path_length < sizeof(source_report_path)
+                ? open(source_report_path, O_WRONLY | O_APPEND, 0600)
+                : -1;
+        report_printf(
+            source_report_fd,
+            "reader_context setpriv_symbol=0x%lx result=0x%llx "
+            "setlogin_symbol=0x%lx result=0x%llx "
+            "setfocus_symbol=0x%lx result=0x%llx\n",
+            (unsigned long)fn_setpriv,
+            (unsigned long long)(uint64_t)setpriv_result,
+            (unsigned long)fn_setloginuser,
+            (unsigned long long)(uint64_t)setlogin_result,
+            (unsigned long)fn_setfocus,
+            (unsigned long long)(uint64_t)setfocus_result);
+        if (source_report_fd >= 0)
+            close(source_report_fd);
     }
 
     pid_t owner_pid = getpid();
@@ -1707,6 +2013,10 @@ wireless_ds4_remote_reader_start(
                     (uint32_t)candidate_handle, 0, 0, 0, 0, 0);
             int32_t read_result = -1;
             int32_t read_connected = 0;
+            int32_t event_result = -1;
+            int32_t event_connected = 0;
+            ScePadData event_data;
+            memset(&event_data, 0, sizeof(event_data));
             if (candidate_handle >= 0) {
                 ScePadData probe_data;
                 memset(&probe_data, 0, sizeof(probe_data));
@@ -1722,6 +2032,22 @@ wireless_ds4_remote_reader_start(
                             target, probe_data_addr,
                             &probe_data, sizeof(probe_data)) == 0)
                         read_connected = probe_data.connected != 0;
+                }
+                if (fn_read) {
+                    memset(&event_data, 0, sizeof(event_data));
+                    if (pt_io_write(
+                            target, probe_data_addr,
+                            &event_data, sizeof(event_data)) == 0) {
+                        event_result = (int32_t)pt_call(
+                            target, fn_read, trap_mem,
+                            (uint32_t)candidate_handle,
+                            (uint64_t)probe_data_addr, 1, 0, 0, 0);
+                        if (event_result > 0 &&
+                            mdbg_copyout(
+                                target, probe_data_addr, &event_data,
+                                sizeof(event_data)) == 0)
+                            event_connected = event_data.connected != 0;
+                    }
                 }
             }
             uint8_t device_info[256];
@@ -1759,8 +2085,7 @@ wireless_ds4_remote_reader_start(
             uint16_t table_product = 0;
             int table_identity = 0;
             if (candidate_handle >= 0 &&
-                firmware == POORDS4_GAME_BRIDGE_FW_1160 &&
-                remote_pad_identity_1160(
+                remote_pad_identity(
                     target, libpad_base, candidate_handle,
                     &table_connected, &table_vendor,
                     &table_product) == 0) {
@@ -1776,7 +2101,8 @@ wireless_ds4_remote_reader_start(
                        sizeof(device_product));
             }
             int public_identity = device_info_result == 0 &&
-                device_info_copy == 0 && read_connected &&
+                device_info_copy == 0 &&
+                (read_connected || event_connected) &&
                 remote_pad_is_known_ds4(
                     1, device_vendor, device_product);
             /* On retail 11.60 this API returns a positive handle-derived
@@ -1786,7 +2112,11 @@ wireless_ds4_remote_reader_start(
                 "[PoorDS4] source candidate user=0x%08x index=%d "
                 "handle=0x%08x is_ds4=0x%08x opened=%d "
                 "connected=%d vid=0x%04x pid=0x%04x "
-                "read=0x%08x read_connected=%d "
+                "state=0x%08x state_connected=%d "
+                "queued=0x%08x queued_connected=%d "
+                "queued_buttons=0x%08x queued_sticks=%u,%u,%u,%u "
+                "queued_triggers=%u,%u queued_timestamp=%llu "
+                "queued_count=%u "
                 "device_id_call=0x%08x device_id=0x%08x "
                 "device_info=0x%08x copy=%d device_vid=0x%04x "
                 "device_pid=0x%04x prefix64=",
@@ -1794,6 +2124,14 @@ wireless_ds4_remote_reader_start(
                 (uint32_t)candidate_handle, (uint32_t)is_ds4,
                 opened_here, table_connected, table_vendor, table_product,
                 (uint32_t)read_result, read_connected,
+                (uint32_t)event_result, event_connected,
+                event_data.buttons,
+                event_data.leftStick.x, event_data.leftStick.y,
+                event_data.rightStick.x, event_data.rightStick.y,
+                event_data.analogButtons.l2,
+                event_data.analogButtons.r2,
+                (unsigned long long)event_data.timestamp,
+                event_data.count,
                 (uint32_t)device_id_result, (uint32_t)device_id,
                 (uint32_t)device_info_result, device_info_copy,
                 device_vendor, device_product);
@@ -1949,10 +2287,12 @@ wireless_ds4_remote_reader_start(
     RemotePadReaderArgs args;
     memset(&args, 0, sizeof(args));
     args.fp_readstate = fn_readstate;
+    args.fp_read = fn_read;
     args.fp_usleep = fn_usleep;
     args.pad_handle = handle;
     args.interval_us = 8333;
     args.last_result = -1;
+    args.last_read_result = -1;
     args.fp_kill = fn_kill;
     args.fp_closepad = fn_closepad;
     args.owner_pid = owner_pid;
@@ -2025,14 +2365,13 @@ cleanup:
             snapshot.seq != 0 &&
             snapshot.pad_data[offsetof(ScePadData, connected)] != 0) {
             int identity_ok = 1;
-            if (firmware == POORDS4_GAME_BRIDGE_FW_1160) {
-                int32_t connected = 0;
-                uint16_t vendor = 0;
-                uint16_t product = 0;
-                identity_ok = remote_pad_identity_1160(
+            int32_t connected = 0;
+            uint16_t vendor = 0;
+            uint16_t product = 0;
+            if (remote_pad_identity(
                     target, libpad_base, handle,
-                    &connected, &vendor, &product) == 0 &&
-                    remote_pad_is_known_ds4(connected, vendor, product);
+                    &connected, &vendor, &product) == 0) {
+                identity_ok = remote_pad_is_known_ds4(connected, vendor, product);
                 klog_printf(
                     "[PoorDS4] async source identity connected=%d "
                     "vid=0x%04x pid=0x%04x accepted=%d\n",
@@ -2052,8 +2391,16 @@ cleanup:
                 out_source->pad_handle = handle;
                 out_source->ds4_connected = selected_is_ds4;
             }
-            klog_printf("[PoorDS4] reader ready pid=%d args=0x%lx\n",
-                        target, args_addr);
+            klog_printf(
+                "[PoorDS4] reader ready pid=%d args=0x%lx "
+                "mode=%u queued=0x%08x success=%u empty=%u "
+                "errors=%u state_fallback=%u\n",
+                target, args_addr, snapshot.reader_mode,
+                (uint32_t)snapshot.last_read_result,
+                snapshot.read_success_frames,
+                snapshot.read_empty_frames,
+                snapshot.read_error_frames,
+                snapshot.state_fallback_frames);
             return 0;
         }
         usleep(10000);
@@ -2145,6 +2492,25 @@ wireless_ds4_remote_reader_status(
     out_status->close_pad_on_exit = snapshot.close_pad_on_exit;
     out_status->connected =
         snapshot.pad_data[offsetof(ScePadData, connected)];
+    out_status->last_read_result = snapshot.last_read_result;
+    out_status->read_success_frames = snapshot.read_success_frames;
+    out_status->read_empty_frames = snapshot.read_empty_frames;
+    out_status->read_error_frames = snapshot.read_error_frames;
+    out_status->state_fallback_frames = snapshot.state_fallback_frames;
+    out_status->reader_mode = snapshot.reader_mode;
+    {
+        const ScePadData *pad =
+            (const ScePadData *)(const void *)snapshot.pad_data;
+        out_status->buttons = pad->buttons;
+        out_status->left_x = pad->leftStick.x;
+        out_status->left_y = pad->leftStick.y;
+        out_status->right_x = pad->rightStick.x;
+        out_status->right_y = pad->rightStick.y;
+        out_status->left_trigger = pad->analogButtons.l2;
+        out_status->right_trigger = pad->analogButtons.r2;
+        out_status->count = pad->count;
+        out_status->timestamp = pad->timestamp;
+    }
     return 0;
 #endif
 }
@@ -2187,8 +2553,23 @@ wireless_ds4_remote_reader_stop(pid_t pid, intptr_t args_kaddr)
     for (unsigned attempt = 0; attempt < 100; attempt++) {
         int32_t ready = 0;
         if (remote_reader_copyout(pid, ready_addr, &ready,
-                                  sizeof(ready)) == 0 && ready == 2)
+                                  sizeof(ready)) == 0 && ready == 2) {
+            RemotePadReaderArgs final_snapshot;
+            memset(&final_snapshot, 0, sizeof(final_snapshot));
+            if (remote_reader_copyout(
+                    pid, args_kaddr, &final_snapshot,
+                    sizeof(final_snapshot)) == 0)
+                klog_printf(
+                    "[PoorDS4] reader final mode=%u queued=0x%08x "
+                    "success=%u empty=%u errors=%u state_fallback=%u\n",
+                    final_snapshot.reader_mode,
+                    (uint32_t)final_snapshot.last_read_result,
+                    final_snapshot.read_success_frames,
+                    final_snapshot.read_empty_frames,
+                    final_snapshot.read_error_frames,
+                    final_snapshot.state_fallback_frames);
             return 0;
+        }
         usleep(10000);
     }
     {
@@ -2204,6 +2585,19 @@ wireless_ds4_remote_reader_stop(pid_t pid, intptr_t args_kaddr)
 #endif
 }
 
+#define POORDS4_READ_STATE_OFFSET_0602 UINT32_C(0x000028a0)
+#define POORDS4_READ_STATE_FNV256_0602 UINT64_C(0x87273539fe448cfc)
+#define POORDS4_READ_OFFSET_0602 UINT32_C(0x000028b0)
+#define POORDS4_READ_FNV256_0602 UINT64_C(0x12240dad3fb2a508)
+#define POORDS4_READ_STATE_EXT_OFFSET_0602 UINT32_C(0x000028c0)
+#define POORDS4_READ_STATE_EXT_FNV256_0602 UINT64_C(0x268b8b5413078c59)
+#define POORDS4_READ_EXT_OFFSET_0602 UINT32_C(0x000028d0)
+#define POORDS4_READ_EXT_FNV256_0602 UINT64_C(0xcaf81821813e484f)
+#define POORDS4_DATA_INTERNAL_OFFSET_0602 UINT32_C(0x00000de0)
+#define POORDS4_DATA_INTERNAL_FNV256_0602 UINT64_C(0x41474651c5a524d6)
+#define POORDS4_CONTROLLER_INFO_OFFSET_0602 UINT32_C(0x00004330)
+#define POORDS4_CONTROLLER_INFO_FNV256_0602 UINT64_C(0x33fa61cc0bb04d2a)
+
 #define POORDS4_READ_STATE_OFFSET_0860 UINT32_C(0x00002a10)
 #define POORDS4_READ_STATE_FNV256_0860 UINT64_C(0xb39fa7c1c539da3c)
 #define POORDS4_READ_OFFSET_0860 UINT32_C(0x00002a20)
@@ -2218,6 +2612,19 @@ wireless_ds4_remote_reader_stop(pid_t pid, intptr_t args_kaddr)
 #define POORDS4_CONTROLLER_INFO_OFFSET_0860 UINT32_C(0x00004780)
 #define POORDS4_CONTROLLER_INFO_FNV256_0860 \
     UINT64_C(0x419d0c07a15038b0)
+
+#define POORDS4_READ_STATE_OFFSET_1001 UINT32_C(0x00002960)
+#define POORDS4_READ_STATE_FNV256_1001 UINT64_C(0x71da09841b4cd6af)
+#define POORDS4_READ_OFFSET_1001 UINT32_C(0x00002970)
+#define POORDS4_READ_FNV256_1001 UINT64_C(0x318bfe94e1803d6e)
+#define POORDS4_READ_STATE_EXT_OFFSET_1001 UINT32_C(0x00002980)
+#define POORDS4_READ_STATE_EXT_FNV256_1001 UINT64_C(0xa2a0ba833c1c4734)
+#define POORDS4_READ_EXT_OFFSET_1001 UINT32_C(0x00002990)
+#define POORDS4_READ_EXT_FNV256_1001 UINT64_C(0x90d246033d34f9b9)
+#define POORDS4_DATA_INTERNAL_OFFSET_1001 UINT32_C(0x00000df0)
+#define POORDS4_DATA_INTERNAL_FNV256_1001 UINT64_C(0x18a406c869932aae)
+#define POORDS4_CONTROLLER_INFO_OFFSET_1001 UINT32_C(0x00004820)
+#define POORDS4_CONTROLLER_INFO_FNV256_1001 UINT64_C(0xc56da126f8d9c1f3)
 
 #define POORDS4_READ_STATE_OFFSET_1160 UINT32_C(0x00002a80)
 #define POORDS4_READ_STATE_FNV256_1160 UINT64_C(0xa4fea18d88eb7cc9)
@@ -2252,7 +2659,9 @@ wireless_ds4_remote_reader_stop(pid_t pid, intptr_t args_kaddr)
 enum {
     POORDS4_MANIFEST_NONE = 0,
     POORDS4_MANIFEST_STRUCTURAL = 1,
+    POORDS4_MANIFEST_0602 = 602,
     POORDS4_MANIFEST_0860 = 860,
+    POORDS4_MANIFEST_1001 = 1001,
     POORDS4_MANIFEST_1160 = 1160,
     POORDS4_MANIFEST_1240 = 1240
 };
@@ -2384,14 +2793,14 @@ game_bridge_target_within_sane_range(intptr_t base, intptr_t target)
 }
 
 static int
-game_bridge_target_is_executable(pid_t pid, intptr_t target)
+game_bridge_target_protection(pid_t pid, intptr_t target)
 {
     for (unsigned attempt = 0; attempt < 3u; ++attempt) {
         int protection = kernel_get_vmem_protection(pid, target, 1);
         if (protection >= 0)
-            return (protection & PROT_EXEC) != 0;
+            return protection;
     }
-    return 0;
+    return -1;
 }
 
 /* Keep rejected-firmware reports useful to the person adding the next
@@ -2403,10 +2812,19 @@ game_bridge_report_prefix(int fd, const char *name,
     if (fd < 0 || !name || !code)
         return;
     size_t count = length < 64u ? length : 64u;
-    report_printf(fd, "%s=", name);
-    for (size_t index = 0; index < count; ++index)
-        report_printf(fd, "%02x", code[index]);
-    report_printf(fd, "\n");
+    char line[256];
+    int prefix_length = snprintf(line, sizeof(line), "%s=", name);
+    if (prefix_length < 0 || (size_t)prefix_length >= sizeof(line))
+        return;
+    static const char digits[] = "0123456789abcdef";
+    size_t cursor = (size_t)prefix_length;
+    for (size_t index = 0;
+         index < count && cursor + 2u < sizeof(line); ++index) {
+        line[cursor++] = digits[code[index] >> 4u];
+        line[cursor++] = digits[code[index] & 0x0fu];
+    }
+    line[cursor] = '\0';
+    report_printf(fd, "%s\n", line);
 }
 
 /* Resolve either a direct rel32 wrapper or a six-byte RIP-relative PLT jump.
@@ -2524,7 +2942,98 @@ static int game_cache_find_libpad_object(
     GameBridgeDynlibObjectPrefix *out_object);
 static int game_cache_find_table(
     pid_t target, intptr_t base, uint64_t mapsize,
-    intptr_t read_state, intptr_t *out_table);
+    intptr_t read_state, int32_t source_user_id,
+    int32_t source_pad_index, int report_fd,
+    intptr_t *out_table, uint32_t *out_stride);
+
+static int
+game_bridge_pointer_in_loaded_object(pid_t target, uint64_t pointer)
+{
+#if !defined(__PROSPERO__)
+    (void)target; (void)pointer;
+    return -1;
+#else
+    if (target <= 0 || pointer == 0)
+        return -1;
+    uint64_t proc = (uint64_t)kernel_get_proc(target);
+    uint64_t shared_object = 0;
+    uint64_t object_address = 0;
+    if (proc == 0 || kernel_copyout(
+            proc + 0x3e8, &shared_object, sizeof(shared_object)) != 0 ||
+        shared_object == 0 || kernel_copyout(
+            shared_object, &object_address, sizeof(object_address)) != 0)
+        return -1;
+    for (unsigned count = 0;
+         object_address != 0 && count < 512u; ++count) {
+        GameBridgeDynlibObjectPrefix object;
+        memset(&object, 0, sizeof(object));
+        if (kernel_copyout(
+                (intptr_t)object_address, &object,
+                sizeof(object)) != 0)
+            return -1;
+        if (object.mapbase != 0 && object.mapsize != 0 &&
+            object.mapsize <= UINT64_MAX - object.mapbase &&
+            pointer >= object.mapbase &&
+            pointer < object.mapbase + object.mapsize)
+            return 1;
+        object_address = object.next;
+    }
+    return 0;
+#endif
+}
+
+static void
+game_bridge_report_libpad_layout(pid_t target, intptr_t base, int report_fd)
+{
+#if defined(__PROSPERO__)
+    GameBridgeDynlibObjectPrefix object;
+    memset(&object, 0, sizeof(object));
+    if (game_cache_find_libpad_object(target, base, &object) != 0) {
+        report_printf(report_fd, "libpad_layout_error=object\n");
+        return;
+    }
+    report_printf(
+        report_fd,
+        "libpad_layout mapbase=0x%llx mapsize=0x%llx sections=%llu "
+        "refcount=%u\n",
+        (unsigned long long)object.mapbase,
+        (unsigned long long)object.mapsize,
+        (unsigned long long)object.section_count, object.refcount);
+    uint64_t section_count = object.section_count;
+    if (!object.sections || section_count > 32u) {
+        report_printf(report_fd, "libpad_layout_error=section_bounds\n");
+        return;
+    }
+    for (uint64_t index = 0; index < section_count; ++index) {
+        GameBridgeSharedLibSection section;
+        memset(&section, 0, sizeof(section));
+        intptr_t section_address = (intptr_t)(object.sections +
+            index * sizeof(section));
+        if (kernel_copyout(
+                section_address, &section, sizeof(section)) != 0) {
+            report_printf(
+                report_fd,
+                "libpad_section_error index=%llu address=0x%lx\n",
+                (unsigned long long)index,
+                (unsigned long)section_address);
+            continue;
+        }
+        int protection = section.address && section.length
+            ? game_bridge_target_protection(
+                target, (intptr_t)section.address) : -1;
+        report_printf(
+            report_fd,
+            "libpad_section index=%llu descriptor=0x%llx "
+            "address=0x%llx length=0x%llx protection=0x%x\n",
+            (unsigned long long)index,
+            (unsigned long long)section.descriptor,
+            (unsigned long long)section.address,
+            (unsigned long long)section.length, protection);
+    }
+#else
+    (void)target; (void)base; (void)report_fd;
+#endif
+}
 
 /* Read the same bounded rtld metadata prefixes used by the SDK's
  * kernel_dynlib helpers. Every followed size, index, pointer, and slot is
@@ -2642,10 +3151,12 @@ game_bridge_collect_import_hooks(
             ? UINT_MAX : (unsigned)rela_count;
         for (uint64_t index = 0; index < rela_count; ++index) {
             Elf64_Rela rela;
+            intptr_t rela_address = (intptr_t)(section.plt_rela +
+                index * sizeof(rela));
             if (kernel_copyout(
-                    (intptr_t)(section.plt_rela +
-                        index * sizeof(rela)),
-                    &rela, sizeof(rela)) != 0) {
+                    rela_address, &rela, sizeof(rela)) != 0 &&
+                game_bridge_process_read(
+                    target, rela_address, &rela, sizeof(rela)) != 0) {
                 report_printf(
                     report_fd,
                     "import_scan_error=rela object=%u index=%llu\n",
@@ -2656,9 +3167,12 @@ game_bridge_collect_import_hooks(
             if (symbol_index >= symbol_count)
                 continue;
             Elf64_Sym symbol;
+            intptr_t symbol_address = (intptr_t)(section.symtab +
+                symbol_index * sizeof(symbol));
             if (kernel_copyout(
-                    (intptr_t)(section.symtab +
-                        symbol_index * sizeof(symbol)),
+                    symbol_address, &symbol, sizeof(symbol)) != 0 &&
+                game_bridge_process_read(
+                    target, symbol_address,
                     &symbol, sizeof(symbol)) != 0) {
                 report_printf(
                     report_fd,
@@ -2667,20 +3181,95 @@ game_bridge_collect_import_hooks(
                     (unsigned long long)symbol_index);
                 return -1;
             }
-            if ((uint64_t)symbol.st_name + 11u >= section.strtab_size)
+            if ((uint64_t)symbol.st_name + 11u > section.strtab_size)
                 continue;
             char symbol_name[12];
-            if (kernel_copyout(
-                    (intptr_t)(section.strtab + symbol.st_name),
-                    symbol_name, sizeof(symbol_name)) != 0) {
-                report_printf(
-                    report_fd,
-                    "import_scan_error=name object=%u index=%llu\n",
-                    object_count - 1u,
-                    (unsigned long long)symbol_index);
-                return -1;
+            memset(symbol_name, 0, sizeof(symbol_name));
+            intptr_t name_address = (intptr_t)(
+                section.strtab + symbol.st_name);
+            int name_read = kernel_copyout(
+                name_address, symbol_name, sizeof(symbol_name) - 1u);
+            if (name_read != 0) {
+                /* The SDK primitive can reject one transfer spanning two
+                 * kernel metadata pages. Retry the fixed 11-byte NID one
+                 * byte at a time before considering a target-space read. */
+                name_read = 0;
+                for (size_t byte = 0;
+                     byte < sizeof(symbol_name) - 1u; ++byte) {
+                    if (kernel_copyout(
+                            name_address + (intptr_t)byte,
+                            symbol_name + byte, 1u) != 0) {
+                        name_read = -1;
+                        break;
+                    }
+                }
             }
-            int kind = game_bridge_symbol_kind(symbol_name, nids);
+            if (name_read != 0)
+                name_read = game_bridge_process_read(
+                    target, name_address, symbol_name,
+                    sizeof(symbol_name) - 1u);
+            int kind = name_read == 0
+                ? game_bridge_symbol_kind(symbol_name, nids) : -1;
+            if (name_read != 0) {
+                if (rela.r_offset >
+                        object.mapsize - sizeof(uint64_t))
+                    continue;
+                intptr_t fallback_slot = (intptr_t)(
+                    object.mapbase + rela.r_offset);
+                uint64_t fallback_current = 0;
+                if (fallback_slot <= 0 || mdbg_copyout(
+                        target, fallback_slot, &fallback_current,
+                        sizeof(fallback_current)) != 0) {
+                    report_printf(
+                        report_fd,
+                        "import_scan_error=name_slot object=%u "
+                        "index=%llu slot=0x%lx\n",
+                        object_count - 1u,
+                        (unsigned long long)symbol_index,
+                        (unsigned long)fallback_slot);
+                    return -1;
+                }
+                for (unsigned candidate_kind = 0;
+                     candidate_kind < 6u; ++candidate_kind) {
+                    if (fallback_current ==
+                            (uint64_t)originals[candidate_kind]) {
+                        kind = (int)candidate_kind;
+                        break;
+                    }
+                }
+                if (kind >= 0) {
+                    report_printf(
+                        report_fd,
+                        "import_name_fallback object=%u index=%llu "
+                        "slot=0x%lx kind=%d current=0x%llx\n",
+                        object_count - 1u,
+                        (unsigned long long)symbol_index,
+                        (unsigned long)fallback_slot, kind,
+                        (unsigned long long)fallback_current);
+                } else if (game_bridge_pointer_in_loaded_object(
+                               target, fallback_current) == 1) {
+                    report_printf(
+                        report_fd,
+                        "import_name_skipped object=%u index=%llu "
+                        "slot=0x%lx current=0x%llx "
+                        "reason=known-module-target\n",
+                        object_count - 1u,
+                        (unsigned long long)symbol_index,
+                        (unsigned long)fallback_slot,
+                        (unsigned long long)fallback_current);
+                    continue;
+                } else {
+                    report_printf(
+                        report_fd,
+                        "import_scan_error=name_unproven object=%u "
+                        "index=%llu slot=0x%lx current=0x%llx\n",
+                        object_count - 1u,
+                        (unsigned long long)symbol_index,
+                        (unsigned long)fallback_slot,
+                        (unsigned long long)fallback_current);
+                    return -1;
+                }
+            }
             if (kind < 0 || originals[kind] <= 0 ||
                 rela.r_offset > object.mapsize - sizeof(uint64_t))
                 continue;
@@ -2749,7 +3338,11 @@ game_bridge_collect_import_hooks(
         report_fd,
         "import_scan_objects=%u relocations=%u hooks=%u\n",
         object_count, relocation_count, *out_count);
-    return *out_count > 0 ? 0 : -1;
+    if (*out_count == 0) {
+        report_printf(report_fd, "import_scan_error=no_supported_hooks\n");
+        return -1;
+    }
+    return 0;
 #endif
 }
 
@@ -2778,8 +3371,14 @@ game_bridge_recover_stale_v1(
            sizeof(*hooks) * POORDS4_GAME_BRIDGE_MAX_IMPORT_HOOKS);
     if (game_bridge_collect_import_hooks(
             target, libpad_base, originals, hooks, out_hook_count,
-            report_fd, 1, 0) != 0)
-        return 0;
+            report_fd, 1, 0) != 0) {
+        /* Hook discovery is also the install-time hook inventory. Never
+         * continue with a partial list after an unreadable relocation or
+         * other scan failure. */
+        *out_hook_count = 0;
+        report_printf(report_fd, "stale_recovery_error=import_scan\n");
+        return -1;
+    }
     uint32_t hook_count = *out_hook_count;
 
     intptr_t args_address = 0;
@@ -2961,6 +3560,7 @@ game_bridge_select_pad_handle(
     GameBridgeDynlibObjectPrefix object;
     memset(&object, 0, sizeof(object));
     intptr_t table = 0;
+    uint32_t table_stride = POORDS4_PAD_CLIENT_STRIDE_1160;
     if (game_cache_find_libpad_object(
             target, libpad_base, &object) != 0) {
         report_printf(report_fd, "error=libpad_object_discovery\n");
@@ -2975,7 +3575,8 @@ game_bridge_select_pad_handle(
         (unsigned long long)object.section_count, object.refcount);
     if (game_cache_find_table(
             target, libpad_base, object.mapsize,
-            read_state, &table) != 0) {
+            read_state, source_user_id, source_pad_index,
+            report_fd, &table, &table_stride) != 0) {
         report_printf(report_fd, "error=pad_client_table_discovery\n");
         return -1;
     }
@@ -2988,21 +3589,25 @@ game_bridge_select_pad_handle(
     int32_t unique_inactive_index = -1;
     int32_t identity_inactive_handle = -1;
     int32_t identity_inactive_index = -1;
+    int32_t source_user_inactive_handle = -1;
+    int32_t source_user_inactive_index = -1;
+    int32_t source_index_inactive_handle = -1;
+    int32_t source_index_inactive_index = -1;
     unsigned active_count = 0;
     unsigned indexed_count = 0;
     unsigned indexed_ds4_count = 0;
     unsigned indexed_inactive_count = 0;
     unsigned identity_count = 0;
     unsigned identity_inactive_count = 0;
+    unsigned source_user_inactive_count = 0;
     unsigned ds4_count = 0;
     unsigned inactive_count = 0;
     report_printf(
-        report_fd, "pad_client_table=0x%lx mapsize=0x%llx\n",
-        (unsigned long)table, (unsigned long long)object.mapsize);
+        report_fd, "pad_client_table=0x%lx stride=0x%x mapsize=0x%llx\n",
+        (unsigned long)table, table_stride, (unsigned long long)object.mapsize);
 
     for (unsigned slot = 0; slot < 24u; ++slot) {
-        intptr_t entry = table + (intptr_t)slot *
-            POORDS4_PAD_CLIENT_STRIDE_1160;
+        intptr_t entry = table + (intptr_t)slot * table_stride;
         int32_t connected = 0;
         int32_t handle = 0;
         int32_t user_id = -1;
@@ -3065,6 +3670,9 @@ game_bridge_select_pad_handle(
         int32_t inferred_index = handle & 0xff;
         int is_ds4 = remote_pad_is_known_ds4(
             connected, vendor, product);
+        int is_inactive = (!connected && !valid);
+        int matches_user = (user_id == source_user_id);
+        int matches_index = (inferred_index == source_pad_index);
         report_printf(
             report_fd,
             "pad_client slot=%u entry=0x%lx handle=0x%08x "
@@ -3082,37 +3690,47 @@ game_bridge_select_pad_handle(
             unique_ds4_handle = handle;
             unique_ds4_index = inferred_index;
         }
-        if (!connected && !valid) {
+        if (is_inactive) {
             inactive_count++;
             unique_inactive_handle = handle;
             unique_inactive_index = inferred_index;
         }
-        if (inferred_index == source_pad_index) {
+        if (matches_index) {
             indexed_count++;
             if (is_ds4)
                 indexed_ds4_count++;
-            if (!connected && !valid)
+            if (is_inactive) {
                 indexed_inactive_count++;
+                source_index_inactive_handle = handle;
+                source_index_inactive_index = inferred_index;
+            }
         }
-        if (user_id == source_user_id &&
-            inferred_index == source_pad_index) {
-            identity_count++;
-            if (!connected && !valid) {
-                identity_inactive_count++;
-                identity_inactive_handle = handle;
-                identity_inactive_index = inferred_index;
+        if (matches_user) {
+            if (is_inactive) {
+                source_user_inactive_count++;
+                source_user_inactive_handle = handle;
+                source_user_inactive_index = inferred_index;
+            }
+            if (matches_index) {
+                identity_count++;
+                if (is_inactive) {
+                    identity_inactive_count++;
+                    identity_inactive_handle = handle;
+                    identity_inactive_index = inferred_index;
+                }
             }
         }
     }
 
     const char *method = "none";
-    /* pad_index is local to one user. It is not the game's P1/P2 slot: two
-     * logged-in users normally both expose source index zero. The game table
-     * is global and orders its handles by player slot. Native PS5 titles keep
-     * each unsupported DS4-facing slot allocated but disconnected, while
-     * real DualSense slots are connected. The (user,index) pair identifies
-     * one controller even when a title preallocates several inactive slots;
-     * an index alone is not global and is never used as a fallback. */
+    /* Multi-slot and multi-controller selection hierarchy:
+     * 1. Exact DS4 identified in game table (e.g. PS4 mode).
+     * 2. Source user + source index inactive match (standard DS4 1st).
+     * 3. Source user unique inactive match (DS4 2nd alongside DualSense or preallocated).
+     * 4. Source user multiple inactive disambiguated by index.
+     * 5. Global unique inactive match (single inactive slot across table).
+     * 6. Global inactive disambiguated by index.
+     * 7. Sole active entry bound to identity. */
     if (ds4_count == 1u) {
         *out_handle = unique_ds4_handle;
         *out_index = unique_ds4_index;
@@ -3122,10 +3740,24 @@ game_bridge_select_pad_handle(
         *out_handle = identity_inactive_handle;
         *out_index = identity_inactive_index;
         method = "source-user-index-inactive";
+    } else if (ds4_count == 0u && source_user_inactive_count == 1u) {
+        *out_handle = source_user_inactive_handle;
+        *out_index = source_user_inactive_index;
+        method = "source-user-inactive-unique";
+    } else if (ds4_count == 0u && source_user_inactive_count > 1u &&
+               indexed_inactive_count == 1u) {
+        *out_handle = source_index_inactive_handle;
+        *out_index = source_index_inactive_index;
+        method = "source-user-index-inactive-unique";
     } else if (ds4_count == 0u && inactive_count == 1u) {
         *out_handle = unique_inactive_handle;
         *out_index = unique_inactive_index;
         method = "global-inactive-unique";
+    } else if (ds4_count == 0u && inactive_count > 1u &&
+               indexed_inactive_count == 1u) {
+        *out_handle = source_index_inactive_handle;
+        *out_index = source_index_inactive_index;
+        method = "global-index-inactive-unique";
     } else if (ds4_count == 0u && inactive_count == 0u &&
                active_count == 1u && identity_count == 1u) {
         *out_handle = sole_handle;
@@ -3201,7 +3833,7 @@ wireless_ds4_game_bridge_run_passive(
         "firmware=0x%08x\npid=%d\nuser_id=0x%08x\n"
         "source_pad_index=%d\nsource_handle=0x%08x\n"
         "source_is_ds4=0x%08x\n"
-        "poords4_rc=%d\nreport_schema=5\n"
+        "poords4_rc=%d\nreport_schema=8\n"
         "install_mode=passive-target-anonymous\nptrace_calls=0\n"
         "remote_game_calls=0\ngame_heap_allocations=0\n",
         firmware, target, (uint32_t)source->user_id,
@@ -3238,6 +3870,7 @@ wireless_ds4_game_bridge_run_passive(
         "data_internal", "controller_info"};
     report_printf(report_fd, "libpad_handle=0x%x libpad_base=0x%lx\n",
                   libpad_handle, (unsigned long)base);
+    game_bridge_report_libpad_layout(target, base, report_fd);
     const uint32_t offsets_1160[6] = {
         POORDS4_READ_STATE_OFFSET_1160,
         POORDS4_READ_STATE_EXT_OFFSET_1160,
@@ -3253,6 +3886,38 @@ wireless_ds4_game_bridge_run_passive(
         POORDS4_READ_EXT_FNV256_1160,
         POORDS4_DATA_INTERNAL_FNV256_1160,
         POORDS4_CONTROLLER_INFO_FNV256_1160
+    };
+    const uint32_t offsets_1001[6] = {
+        POORDS4_READ_STATE_OFFSET_1001,
+        POORDS4_READ_STATE_EXT_OFFSET_1001,
+        POORDS4_READ_OFFSET_1001,
+        POORDS4_READ_EXT_OFFSET_1001,
+        POORDS4_DATA_INTERNAL_OFFSET_1001,
+        POORDS4_CONTROLLER_INFO_OFFSET_1001
+    };
+    const uint64_t hashes_1001[6] = {
+        POORDS4_READ_STATE_FNV256_1001,
+        POORDS4_READ_STATE_EXT_FNV256_1001,
+        POORDS4_READ_FNV256_1001,
+        POORDS4_READ_EXT_FNV256_1001,
+        POORDS4_DATA_INTERNAL_FNV256_1001,
+        POORDS4_CONTROLLER_INFO_FNV256_1001
+    };
+    const uint32_t offsets_0602[6] = {
+        POORDS4_READ_STATE_OFFSET_0602,
+        POORDS4_READ_STATE_EXT_OFFSET_0602,
+        POORDS4_READ_OFFSET_0602,
+        POORDS4_READ_EXT_OFFSET_0602,
+        POORDS4_DATA_INTERNAL_OFFSET_0602,
+        POORDS4_CONTROLLER_INFO_OFFSET_0602
+    };
+    const uint64_t hashes_0602[6] = {
+        POORDS4_READ_STATE_FNV256_0602,
+        POORDS4_READ_STATE_EXT_FNV256_0602,
+        POORDS4_READ_FNV256_0602,
+        POORDS4_READ_EXT_FNV256_0602,
+        POORDS4_DATA_INTERNAL_FNV256_0602,
+        POORDS4_CONTROLLER_INFO_FNV256_0602
     };
     const uint32_t offsets_0860[6] = {
         POORDS4_READ_STATE_OFFSET_0860,
@@ -3287,11 +3952,15 @@ wireless_ds4_game_bridge_run_passive(
         POORDS4_CONTROLLER_INFO_FNV256_1240
     };
     const uint32_t *expected_offsets =
+        firmware == POORDS4_GAME_BRIDGE_FW_0602 ? offsets_0602 :
         firmware == POORDS4_GAME_BRIDGE_FW_0860 ? offsets_0860 :
+        firmware == POORDS4_GAME_BRIDGE_FW_1001 ? offsets_1001 :
         firmware == POORDS4_GAME_BRIDGE_FW_1160 ? offsets_1160 :
         firmware == POORDS4_GAME_BRIDGE_FW_1240 ? offsets_1240 : NULL;
     const uint64_t *expected_hashes =
+        firmware == POORDS4_GAME_BRIDGE_FW_0602 ? hashes_0602 :
         firmware == POORDS4_GAME_BRIDGE_FW_0860 ? hashes_0860 :
+        firmware == POORDS4_GAME_BRIDGE_FW_1001 ? hashes_1001 :
         firmware == POORDS4_GAME_BRIDGE_FW_1160 ? hashes_1160 :
         firmware == POORDS4_GAME_BRIDGE_FW_1240 ? hashes_1240 : NULL;
     int exact_manifest = expected_offsets && expected_hashes;
@@ -3355,12 +4024,18 @@ wireless_ds4_game_bridge_run_passive(
         wrapper_targets[0] == wrapper_targets[1];
     int common_read_target =
         wrapper_targets[2] == wrapper_targets[3];
-    int state_target_exec = common_state_target &&
-        game_bridge_target_is_executable(target, wrapper_targets[0]);
-    int read_target_exec = common_read_target &&
-        game_bridge_target_is_executable(target, wrapper_targets[2]);
-    int data_target_exec = wrapper_targets_ok[4] &&
-        game_bridge_target_is_executable(target, wrapper_targets[4]);
+    int state_target_protection = common_state_target
+        ? game_bridge_target_protection(target, wrapper_targets[0]) : -1;
+    int read_target_protection = common_read_target
+        ? game_bridge_target_protection(target, wrapper_targets[2]) : -1;
+    int data_target_protection = wrapper_targets_ok[4]
+        ? game_bridge_target_protection(target, wrapper_targets[4]) : -1;
+    int state_target_exec = state_target_protection >= 0 &&
+        (state_target_protection & PROT_EXEC) != 0;
+    int read_target_exec = read_target_protection >= 0 &&
+        (read_target_protection & PROT_EXEC) != 0;
+    int data_target_exec = data_target_protection >= 0 &&
+        (data_target_protection & PROT_EXEC) != 0;
     wrapper_targets_exec[0] = wrapper_targets_exec[1] =
         state_target_exec;
     wrapper_targets_exec[2] = wrapper_targets_exec[3] =
@@ -3369,8 +4044,10 @@ wireless_ds4_game_bridge_run_passive(
     int controller_info_prefix_ok =
         memcmp(fingerprints[5], controller_info_prologue,
                sizeof(controller_info_prologue)) == 0;
-    int controller_info_exec =
-        game_bridge_target_is_executable(target, originals[5]);
+    int controller_info_protection =
+        game_bridge_target_protection(target, originals[5]);
+    int controller_info_exec = controller_info_protection >= 0 &&
+        (controller_info_protection & PROT_EXEC) != 0;
     uint64_t game_pad_hashes[POORDS4_PAD_FINGERPRINT_COUNT];
     int source_library_match =
         g_source_pad_firmware == firmware &&
@@ -3387,6 +4064,16 @@ wireless_ds4_game_bridge_run_passive(
         g_source_controller_info_runtime_abi;
     int controller_info_abi_ok = controller_info_prefix_ok ||
         source_runtime_abi_match;
+    int structural_nonmapping_ok = common_state_target &&
+        common_read_target && controller_info_abi_ok;
+    for (unsigned index = 0; index < 5; ++index) {
+        if (!wrapper_shapes_ok[index] || !wrapper_targets_ok[index])
+            structural_nonmapping_ok = 0;
+    }
+    int executable_mapping_wait = exact_manifest &&
+        structural_nonmapping_ok &&
+        (!state_target_exec || !read_target_exec ||
+         !data_target_exec || !controller_info_exec);
     if (!common_state_target || !common_read_target ||
         !state_target_exec || !read_target_exec || !data_target_exec ||
         !controller_info_abi_ok || !controller_info_exec)
@@ -3397,10 +4084,14 @@ wireless_ds4_game_bridge_run_passive(
         "wrapper_shapes=%zu,%zu,%zu,%zu,%zu\n"
         "wrapper_targets=0x%lx,0x%lx,0x%lx,0x%lx,0x%lx\n",
         exact_manifest
-            ? (firmware == POORDS4_GAME_BRIDGE_FW_0860
-                ? "8.60-exact"
-                : firmware == POORDS4_GAME_BRIDGE_FW_1160
-                    ? "11.60-exact" : "12.40-exact")
+            ? (firmware == POORDS4_GAME_BRIDGE_FW_0602
+                ? "6.02-exact"
+                : firmware == POORDS4_GAME_BRIDGE_FW_0860
+                    ? "8.60-exact"
+                    : firmware == POORDS4_GAME_BRIDGE_FW_1001
+                        ? "10.01-exact"
+                        : firmware == POORDS4_GAME_BRIDGE_FW_1160
+                            ? "11.60-exact" : "12.40-exact")
             : "structural-runtime",
         structural_abi, jump_offsets[0], jump_offsets[1],
         jump_offsets[2], jump_offsets[3], jump_offsets[4],
@@ -3429,9 +4120,20 @@ wireless_ds4_game_bridge_run_passive(
         controller_info_exec, controller_info_abi_ok,
         g_source_pad_firmware, g_source_pad_fingerprint_mask,
         source_library_match, g_source_controller_info_runtime_abi);
+    report_printf(
+        report_fd,
+        "target_protection state=0x%x read=0x%x data=0x%x "
+        "controller_info=0x%x\n",
+        state_target_protection, read_target_protection,
+        data_target_protection, controller_info_protection);
     if (!structural_abi) {
-        report_printf(report_fd, "error=unsupported_firmware_abi\n");
-        result = 0;
+        report_printf(
+            report_fd,
+            "error=%s\n",
+            executable_mapping_wait
+                ? "waiting_for_executable_mapping"
+                : "unsupported_firmware_abi");
+        result = executable_mapping_wait ? -4 : 0;
         goto done;
     }
 
@@ -3917,6 +4619,25 @@ wireless_ds4_game_bridge_status(pid_t game_pid, intptr_t args_kaddr,
         args.controller_info_result_overrides;
     out_status->native_backing_calls = args.native_backing_calls;
     out_status->native_backing_errors = args.native_backing_errors;
+    out_status->native_passthrough_frames =
+        args.native_passthrough_frames;
+    out_status->native_connected_frames = args.native_connected_frames;
+    out_status->direct_fallback_frames = args.direct_fallback_frames;
+    out_status->direct_active_fallbacks = args.direct_active_fallbacks;
+    out_status->last_native_result = args.last_native_result;
+    out_status->native_success_frames = args.native_success_frames;
+    out_status->native_input_activity_frames =
+        args.native_input_activity_frames;
+    out_status->last_native_timestamp = args.last_native_timestamp;
+    out_status->last_native_buttons = args.last_native_buttons;
+    out_status->last_native_lx = args.last_native_lx;
+    out_status->last_native_ly = args.last_native_ly;
+    out_status->last_native_rx = args.last_native_rx;
+    out_status->last_native_ry = args.last_native_ry;
+    out_status->last_native_l2 = args.last_native_l2;
+    out_status->last_native_r2 = args.last_native_r2;
+    out_status->last_native_connected = args.last_native_connected;
+    out_status->last_native_count = args.last_native_count;
     out_status->import_hook_count = args.import_hook_count;
     out_status->game_pad_index = (int32_t)args.reserved0;
     out_status->buttons = pad.buttons;
@@ -4078,9 +4799,9 @@ report_printf(int fd, const char *format, ...)
 }
 
 static int
-remote_pad_identity_1160(pid_t pid, intptr_t libpad_base,
-                         int32_t pad_handle, int32_t *out_connected,
-                         uint16_t *out_vendor, uint16_t *out_product)
+remote_pad_identity(pid_t pid, intptr_t libpad_base,
+                    int32_t pad_handle, int32_t *out_connected,
+                    uint16_t *out_vendor, uint16_t *out_product)
 {
 #if !defined(__PROSPERO__)
     (void)pid; (void)libpad_base; (void)pad_handle;
@@ -4091,38 +4812,54 @@ remote_pad_identity_1160(pid_t pid, intptr_t libpad_base,
         !out_vendor || !out_product)
         return -1;
 
-    for (unsigned slot = 0; slot < 16; ++slot) {
-        intptr_t entry = libpad_base + POORDS4_PAD_CLIENT_TABLE_1160 +
-            (intptr_t)slot * POORDS4_PAD_CLIENT_STRIDE_1160;
-        uint32_t candidate_handle = 0;
-        if (remote_reader_copyout(
-                pid, entry + POORDS4_PAD_CLIENT_HANDLE_1160,
-                &candidate_handle, sizeof(candidate_handle)) != 0)
-            return -1;
-        if (candidate_handle != (uint32_t)pad_handle)
-            continue;
+    const uint32_t strides[] = {
+        POORDS4_PAD_CLIENT_STRIDE_1160,
+        POORDS4_PAD_CLIENT_STRIDE_0602
+    };
+    for (unsigned s = 0; s < 2u; ++s) {
+        uint32_t stride = strides[s];
+        for (unsigned slot = 0; slot < 16; ++slot) {
+            intptr_t entry = libpad_base + POORDS4_PAD_CLIENT_TABLE_1160 +
+                (intptr_t)slot * stride;
+            uint32_t candidate_handle = 0;
+            if (remote_reader_copyout(
+                    pid, entry + POORDS4_PAD_CLIENT_HANDLE_1160,
+                    &candidate_handle, sizeof(candidate_handle)) != 0)
+                break;
+            if (candidate_handle != (uint32_t)pad_handle)
+                continue;
 
-        int32_t connected = 0;
-        uint16_t vendor = 0;
-        uint16_t product = 0;
-        if (remote_reader_copyout(
-                pid, entry + POORDS4_PAD_CLIENT_CONNECTED_1160,
-                &connected, sizeof(connected)) != 0 ||
-            remote_reader_copyout(
-                pid, entry + POORDS4_PAD_CLIENT_VENDOR_1160,
-                &vendor, sizeof(vendor)) != 0 ||
-            remote_reader_copyout(
-                pid, entry + POORDS4_PAD_CLIENT_PRODUCT_1160,
-                &product, sizeof(product)) != 0)
-            return -1;
+            int32_t connected = 0;
+            uint16_t vendor = 0;
+            uint16_t product = 0;
+            if (remote_reader_copyout(
+                    pid, entry + POORDS4_PAD_CLIENT_CONNECTED_1160,
+                    &connected, sizeof(connected)) != 0 ||
+                remote_reader_copyout(
+                    pid, entry + POORDS4_PAD_CLIENT_VENDOR_1160,
+                    &vendor, sizeof(vendor)) != 0 ||
+                remote_reader_copyout(
+                    pid, entry + POORDS4_PAD_CLIENT_PRODUCT_1160,
+                    &product, sizeof(product)) != 0)
+                break;
 
-        *out_connected = connected;
-        *out_vendor = vendor;
-        *out_product = product;
-        return 0;
+            *out_connected = connected;
+            *out_vendor = vendor;
+            *out_product = product;
+            return 0;
+        }
     }
     return -1;
 #endif
+}
+
+static int __attribute__((unused))
+remote_pad_identity_1160(pid_t pid, intptr_t libpad_base,
+                         int32_t pad_handle, int32_t *out_connected,
+                         uint16_t *out_vendor, uint16_t *out_product)
+{
+    return remote_pad_identity(
+        pid, libpad_base, pad_handle, out_connected, out_vendor, out_product);
 }
 
 static int
@@ -4212,57 +4949,328 @@ game_cache_follow_read_state(pid_t target, intptr_t base,
 }
 
 static int
-game_cache_find_table(pid_t target, intptr_t base, uint64_t mapsize,
-                      intptr_t read_state, intptr_t *out_table)
+game_cache_validate_table_candidate(
+    pid_t target, intptr_t base, uint64_t mapsize, intptr_t candidate,
+    uint32_t stride,
+    int32_t source_user_id, int32_t source_pad_index,
+    unsigned *out_entries, unsigned *out_identity)
+{
+#if !defined(__PROSPERO__)
+    (void)target; (void)base; (void)mapsize; (void)candidate; (void)stride;
+    (void)source_user_id; (void)source_pad_index;
+    (void)out_entries; (void)out_identity;
+    return 0;
+#else
+    if (out_entries) *out_entries = 0;
+    if (out_identity) *out_identity = 0;
+    if (stride < 0x200u)
+        return 0;
+    const uint64_t required =
+        UINT64_C(23) * stride +
+        POORDS4_PAD_CLIENT_PRODUCT_1160 + sizeof(uint16_t);
+    if (candidate < base || (uint64_t)(candidate - base) >= mapsize ||
+        mapsize - (uint64_t)(candidate - base) < required)
+        return 0;
+
+    unsigned entries = 0;
+    unsigned identity = 0;
+    unsigned user_matches = 0;
+    for (unsigned slot = 0; slot < 24u; ++slot) {
+        intptr_t entry = candidate + (intptr_t)slot * stride;
+        int32_t connected = 0;
+        int32_t handle = 0;
+        int32_t user_id = -1;
+        int32_t valid = 0;
+        if (game_bridge_process_read(
+                target, entry + POORDS4_PAD_CLIENT_CONNECTED_1160,
+                &connected, sizeof(connected)) != 0 ||
+            game_bridge_process_read(
+                target, entry + POORDS4_PAD_CLIENT_HANDLE_1160,
+                &handle, sizeof(handle)) != 0 ||
+            game_bridge_process_read(
+                target, entry + POORDS4_PAD_CLIENT_USER_ID_1160,
+                &user_id, sizeof(user_id)) != 0 ||
+            game_bridge_process_read(
+                target, entry + 0x38, &valid, sizeof(valid)) != 0)
+            return 0;
+        if (handle <= 0)
+            continue;
+        int32_t index = handle & 0xff;
+        if (index < 0 || index >= 8 || user_id < 0 ||
+            (connected != 0 && connected != 1) ||
+            (valid != 0 && valid != 1))
+            return 0;
+        entries++;
+        if (user_id == source_user_id)
+            user_matches++;
+        if (user_id == source_user_id && index == source_pad_index)
+            identity++;
+    }
+    if (out_entries) *out_entries = entries;
+    if (out_identity) *out_identity = identity;
+    return entries > 0u && (identity == 1u || (source_user_id >= 0 && user_matches >= 1u));
+#endif
+}
+
+static void
+game_cache_report_user_hits(
+    pid_t target, intptr_t base, uint64_t mapsize,
+    int32_t source_user_id, int report_fd)
+{
+#if defined(__PROSPERO__)
+    uint64_t scan_size = mapsize;
+    if (scan_size > UINT64_C(0x00100000))
+        scan_size = UINT64_C(0x00100000);
+    uint8_t block[0x1000];
+    unsigned hits = 0;
+    unsigned read_failures = 0;
+    uint64_t offset = 0;
+    while (offset < scan_size && hits < 32u) {
+        size_t length = sizeof(block);
+        if ((uint64_t)length > scan_size - offset)
+            length = (size_t)(scan_size - offset);
+        if (mdbg_copyout(
+                target, base + (intptr_t)offset,
+                block, length) != 0) {
+            read_failures++;
+        } else {
+            for (size_t index = 0; index + sizeof(source_user_id) <= length;
+                 ++index) {
+                int32_t value = -1;
+                memcpy(&value, block + index, sizeof(value));
+                if (value != source_user_id)
+                    continue;
+                intptr_t address = base + (intptr_t)offset +
+                    (intptr_t)index;
+                report_printf(
+                    report_fd,
+                    "client_user_hit index=%u address=0x%lx "
+                    "offset=0x%lx\n",
+                    hits, (unsigned long)address,
+                    (unsigned long)(address - base));
+                intptr_t context = address - 64;
+                if (context < base)
+                    context = base;
+                uint8_t bytes[128];
+                if ((uint64_t)(context - base) + sizeof(bytes) <= mapsize &&
+                    mdbg_copyout(
+                        target, context, bytes, sizeof(bytes)) == 0) {
+                    char name[64];
+                    snprintf(name, sizeof(name),
+                             "client_user_hit_%u_context_0000", hits);
+                    game_bridge_report_prefix(
+                        report_fd, name, bytes, 64u);
+                    snprintf(name, sizeof(name),
+                             "client_user_hit_%u_context_0040", hits);
+                    game_bridge_report_prefix(
+                        report_fd, name, bytes + 64u, 64u);
+                }
+                hits++;
+                if (hits >= 32u)
+                    break;
+            }
+        }
+        if (length <= 3u)
+            break;
+        offset += length - 3u;
+    }
+    report_printf(
+        report_fd,
+        "client_user_scan bytes=0x%llx hits=%u read_failures=%u "
+        "truncated=%d\n",
+        (unsigned long long)scan_size, hits, read_failures,
+        hits >= 32u);
+#else
+    (void)target; (void)base; (void)mapsize;
+    (void)source_user_id; (void)report_fd;
+#endif
+}
+
+static int
+game_cache_find_table(
+    pid_t target, intptr_t base, uint64_t mapsize,
+    intptr_t read_state, int32_t source_user_id,
+    int32_t source_pad_index, int report_fd,
+    intptr_t *out_table, uint32_t *out_stride)
 {
 #if !defined(__PROSPERO__)
     (void)target; (void)base; (void)mapsize; (void)read_state;
-    (void)out_table;
+    (void)source_user_id; (void)source_pad_index; (void)report_fd;
+    (void)out_table; (void)out_stride;
     return -1;
 #else
     intptr_t internal = 0;
     if (!out_table || game_cache_follow_read_state(
             target, base, mapsize, read_state, &internal) != 0)
         return -1;
-    uint8_t code[0x300];
-    if (mdbg_copyout(target, internal, code, sizeof(code)) != 0)
+    *out_table = 0;
+    if (out_stride)
+        *out_stride = POORDS4_PAD_CLIENT_STRIDE_1160;
+    if (internal < base || (uint64_t)(internal - base) >= mapsize)
         return -1;
-    for (size_t offset = 0; offset + 7u <= sizeof(code); ++offset) {
-        if (code[offset] != 0x48 || code[offset + 1u] != 0x8d ||
-            code[offset + 2u] != 0x0d)
+    uint8_t code[0x800];
+    size_t code_size = sizeof(code);
+    uint64_t available = mapsize - (uint64_t)(internal - base);
+    if ((uint64_t)code_size > available)
+        code_size = (size_t)available;
+    if (code_size < 32u ||
+        mdbg_copyout(target, internal, code, code_size) != 0)
+        return -1;
+
+    unsigned stride_immediates = 0;
+    unsigned span_immediates = 0;
+    unsigned stride_548_immediates = 0;
+    unsigned span_7ec0_immediates = 0;
+    for (size_t offset = 0; offset + 4u <= code_size; ++offset) {
+        uint32_t immediate = 0;
+        memcpy(&immediate, code + offset, sizeof(immediate));
+        if (immediate == POORDS4_PAD_CLIENT_STRIDE_1160)
+            stride_immediates++;
+        if (immediate == POORDS4_PAD_CLIENT_STRIDE_0602)
+            stride_548_immediates++;
+        if (immediate == POORDS4_PAD_CLIENT_SPAN_1160)
+            span_immediates++;
+        if (immediate == POORDS4_PAD_CLIENT_SPAN_0602)
+            span_7ec0_immediates++;
+    }
+    report_printf(
+        report_fd,
+        "client_locator internal=0x%lx offset=0x%lx bytes=0x%zx "
+        "fnv=0x%016llx stride_immediates=%u span_immediates=%u "
+        "stride_548=%u span_7ec0=%u\n",
+        (unsigned long)internal, (unsigned long)(internal - base),
+        code_size,
+        (unsigned long long)poords4_fnv1a64(code, code_size),
+        stride_immediates, span_immediates,
+        stride_548_immediates, span_7ec0_immediates);
+    size_t dump_size = code_size < 0x400u ? code_size : 0x400u;
+    for (size_t offset = 0; offset < dump_size; offset += 64u) {
+        char name[64];
+        snprintf(name, sizeof(name),
+                 "client_locator_code_%04zx", offset);
+        size_t length = dump_size - offset;
+        if (length > 64u) length = 64u;
+        game_bridge_report_prefix(
+            report_fd, name, code + offset, length);
+    }
+
+    const uint32_t candidate_strides[2] = {
+        (stride_548_immediates > 0 || span_7ec0_immediates > 0)
+            ? POORDS4_PAD_CLIENT_STRIDE_0602 : POORDS4_PAD_CLIENT_STRIDE_1160,
+        (stride_548_immediates > 0 || span_7ec0_immediates > 0)
+            ? POORDS4_PAD_CLIENT_STRIDE_1160 : POORDS4_PAD_CLIENT_STRIDE_0602
+    };
+
+    static const int32_t adjustments[] = {
+        0, -0x08, -0x10, -0x18, -0x1c, -0x20,
+        -0x24, -0x28, -0x38, -0x40, -0x60, -0x4b8
+    };
+    intptr_t matches[16];
+    uint32_t match_strides[16];
+    unsigned match_count = 0;
+    unsigned ref_count = 0;
+    for (size_t offset = 0; offset + 7u <= code_size; ++offset) {
+        uint8_t rex = code[offset];
+        uint8_t opcode = code[offset + 1u];
+        uint8_t modrm = code[offset + 2u];
+        if (rex < 0x40 || rex > 0x4f ||
+            (opcode != 0x8d && opcode != 0x8b) ||
+            (modrm & 0xc7u) != 0x05u)
             continue;
         int32_t displacement = 0;
         memcpy(&displacement, code + offset + 3u, sizeof(displacement));
-        intptr_t candidate = internal + (intptr_t)offset + 7 +
-                             (intptr_t)displacement;
-        if (candidate < base || (uint64_t)(candidate - base) >= mapsize ||
-            mapsize - (uint64_t)(candidate - base) < UINT64_C(0x8ac0))
-            continue;
-        /* The read implementation walks 24 entries with a 0x5c8 stride.
-         * Require both loop constants near the RIP-relative table reference;
-         * this discovers the table from code shape instead of a firmware
-         * offset. */
-        int has_stride = 0;
-        int has_limit = 0;
-        size_t end = offset + 160u;
-        if (end > sizeof(code)) end = sizeof(code);
-        for (size_t scan = offset; scan + 6u <= end; ++scan) {
-            static const uint8_t stride_pattern[6] =
-                {0x48, 0x05, 0xc8, 0x05, 0x00, 0x00};
-            static const uint8_t limit_pattern[6] =
-                {0x48, 0x3d, 0xc0, 0x8a, 0x00, 0x00};
-            if (memcmp(code + scan, stride_pattern,
-                       sizeof(stride_pattern)) == 0)
-                has_stride = 1;
-            if (memcmp(code + scan, limit_pattern,
-                       sizeof(limit_pattern)) == 0)
-                has_limit = 1;
+        intptr_t reference = internal + (intptr_t)offset + 7 +
+            (intptr_t)displacement;
+        intptr_t indirect = 0;
+        if (opcode == 0x8b) {
+            uint64_t pointer = 0;
+            if (reference > 0 && mdbg_copyout(
+                    target, reference, &pointer, sizeof(pointer)) == 0 &&
+                pointer <= (uint64_t)INTPTR_MAX)
+                indirect = (intptr_t)pointer;
         }
-        if (!has_stride || !has_limit)
-            continue;
-        *out_table = candidate;
+        if (ref_count < 64u) {
+            report_printf(
+                report_fd,
+                "client_locator_ref index=%u insn=0x%zx opcode=0x%02x "
+                "modrm=0x%02x reference=0x%lx offset=0x%lx "
+                "indirect=0x%lx\n",
+                ref_count, offset, opcode, modrm,
+                (unsigned long)reference,
+                reference >= base
+                    ? (unsigned long)(reference - base) : 0ul,
+                (unsigned long)indirect);
+        }
+        ref_count++;
+
+        intptr_t roots[2] = {reference, indirect};
+        for (unsigned root_index = 0; root_index < 2u; ++root_index) {
+            if (roots[root_index] <= 0)
+                continue;
+            for (unsigned adjustment_index = 0;
+                 adjustment_index <
+                    sizeof(adjustments) / sizeof(adjustments[0]);
+                 ++adjustment_index) {
+                intptr_t candidate = roots[root_index] +
+                    (intptr_t)adjustments[adjustment_index];
+                for (unsigned s_idx = 0; s_idx < 2u; ++s_idx) {
+                    uint32_t stride_cand = candidate_strides[s_idx];
+                    unsigned entries = 0;
+                    unsigned identity = 0;
+                    int valid = game_cache_validate_table_candidate(
+                        target, base, mapsize, candidate, stride_cand,
+                        source_user_id, source_pad_index,
+                        &entries, &identity);
+                    if (entries > 0u || identity > 0u || valid) {
+                        report_printf(
+                            report_fd,
+                            "client_locator_candidate address=0x%lx "
+                            "offset=0x%lx stride=0x%x root=%s adjustment=%d "
+                            "entries=%u identity=%u valid=%d\n",
+                            (unsigned long)candidate,
+                            candidate >= base
+                                ? (unsigned long)(candidate - base) : 0ul,
+                            stride_cand,
+                            root_index == 0u ? "direct" : "indirect",
+                            adjustments[adjustment_index], entries,
+                            identity, valid);
+                    }
+                    if (!valid)
+                        continue;
+                    int duplicate = 0;
+                    for (unsigned prior = 0; prior < match_count; ++prior) {
+                        if (matches[prior] == candidate) {
+                            duplicate = 1;
+                            break;
+                        }
+                    }
+                    if (!duplicate && match_count <
+                            sizeof(matches) / sizeof(matches[0])) {
+                        matches[match_count] = candidate;
+                        match_strides[match_count] = stride_cand;
+                        match_count++;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    report_printf(
+        report_fd,
+        "client_locator_summary refs=%u matches=%u\n",
+        ref_count, match_count);
+    if (match_count == 1u) {
+        *out_table = matches[0];
+        if (out_stride)
+            *out_stride = match_strides[0];
         return 0;
     }
+    if (match_count > 1u)
+        report_printf(report_fd, "client_locator_error=ambiguous\n");
+    else
+        report_printf(report_fd, "client_locator_error=no_valid_table\n");
+    game_cache_report_user_hits(
+        target, base, mapsize, source_user_id, report_fd);
     return -1;
 #endif
 }

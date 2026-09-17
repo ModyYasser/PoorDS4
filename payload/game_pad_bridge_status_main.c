@@ -105,6 +105,17 @@ main(void)
         "reader_owner_miss_count=%u\n"
         "reader_owner_watchdog_exits=%u\n"
         "reader_close_pad_on_exit=%d\nreader_connected=%u\n"
+        "reader_mode=%u\n"
+        "reader_last_queued_result=0x%08x\n"
+        "reader_queued_success_frames=%u\n"
+        "reader_queued_empty_frames=%u\n"
+        "reader_queued_error_frames=%u\n"
+        "reader_state_fallback_frames=%u\n"
+        "reader_buttons=0x%08x\n"
+        "reader_sticks=%u,%u,%u,%u\n"
+        "reader_triggers=%u,%u\n"
+        "reader_timestamp=%llu\n"
+        "reader_count=%u\n"
         "--- supervisor ---\n%s",
         (int)supervisor_length, identity_result, reader_pid,
         (unsigned long)reader_args, reader_result,
@@ -112,7 +123,16 @@ main(void)
         (uint32_t)reader.pad_handle, reader.owner_pid,
         reader.owner_check_interval, reader.owner_miss_count,
         reader.owner_watchdog_exits, reader.close_pad_on_exit,
-        reader.connected, supervisor);
+        reader.connected, reader.reader_mode,
+        (uint32_t)reader.last_read_result,
+        reader.read_success_frames, reader.read_empty_frames,
+        reader.read_error_frames, reader.state_fallback_frames,
+        reader.buttons,
+        reader.left_x, reader.left_y,
+        reader.right_x, reader.right_y,
+        reader.left_trigger, reader.right_trigger,
+        (unsigned long long)reader.timestamp, reader.count,
+        supervisor);
 
     int success = length > 0;
     size_t used = success && (size_t)length < sizeof(report)

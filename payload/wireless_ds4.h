@@ -34,6 +34,22 @@ typedef struct {
     uint32_t owner_watchdog_exits;
     int32_t close_pad_on_exit;
     uint8_t connected;
+    int32_t last_read_result;
+    uint32_t read_success_frames;
+    uint32_t read_empty_frames;
+    uint32_t read_error_frames;
+    uint32_t state_fallback_frames;
+    uint32_t reader_mode;
+    uint32_t buttons;
+    uint8_t left_x;
+    uint8_t left_y;
+    uint8_t right_x;
+    uint8_t right_y;
+    uint8_t left_trigger;
+    uint8_t right_trigger;
+    uint8_t count;
+    uint8_t reserved0;
+    uint64_t timestamp;
 } PoorDS4RemoteReaderStatus;
 
 int wireless_ds4_remote_reader_status(
@@ -68,6 +84,23 @@ typedef struct {
     uint64_t controller_info_result_overrides;
     uint64_t native_backing_calls;
     uint64_t native_backing_errors;
+    uint64_t native_passthrough_frames;
+    uint64_t native_connected_frames;
+    uint64_t direct_fallback_frames;
+    uint64_t direct_active_fallbacks;
+    int32_t last_native_result;
+    uint64_t native_success_frames;
+    uint64_t native_input_activity_frames;
+    uint64_t last_native_timestamp;
+    uint32_t last_native_buttons;
+    uint8_t last_native_lx;
+    uint8_t last_native_ly;
+    uint8_t last_native_rx;
+    uint8_t last_native_ry;
+    uint8_t last_native_l2;
+    uint8_t last_native_r2;
+    uint8_t last_native_connected;
+    uint8_t last_native_count;
     uint32_t import_hook_count;
     int32_t game_pad_index;
     uint32_t buttons;

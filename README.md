@@ -69,10 +69,12 @@ safety and cleanup invariants.
 
 | Firmware | Status |
 | --- | --- |
-| 8.60 (`0x08600004`) | Exact manifest derived from a supplied RC37 source report; RC38 hardware test required |
-| 11.60 (`0x11600005`) | Live-tested with multiple games, reconnects, game switching, multiplayer, and rest cleanup |
-| 12.40 (`0x12400009`) | Exact manifest verified from supplied reports; RC38 hardware test still required |
-| Other | Eligible only after all runtime structural checks pass; hardware-unverified |
+| 6.02 (`0x06020004`) | Exact manifest and dynamic table stride (`0x548`) verified from memory dumps |
+| 8.60 (`0x08600004`) | RC39 installed cleanly; RC42/RC43 includes queued/state source reader, source-context setup, and native-frame preservation |
+| 10.01 (`0x10010000`) | Exact manifest and stride (`0x5c8`) verified from memory dumps |
+| 11.60 (`0x11600005`) | Live-tested across multiple games (Greak, Pragmata, JoJo, FC 26), multiple connection orders, reconnects, and rest cleanup |
+| 12.40 (`0x12400009`) | Exact manifest verified from supplied reports and memory dumps |
+| Other | Dynamic table stride discovery (`0x548`/`0x5c8`) and structural verification allow execution if ABI matches; fails closed safely |
 
 Compatibility is based on proven ABI structure, not a broad `11.xx` or `12.xx`
 version assumption. Unknown layouts fail closed and produce a report instead
@@ -97,11 +99,11 @@ make -C payload CC=ps5-clang.cmd clean
 make -C payload CC=ps5-clang.cmd release audit
 ```
 
-RC38 release assets use ps5-payload-sdk v0.42:
+RC43 release assets use ps5-payload-sdk v0.42:
 
 | Output | Purpose |
 | --- | --- |
-| `PoorDS4rc38.elf` | Automatic wireless DS4 bridge |
+| `PoorDS4rc43.elf` | Automatic wireless DS4 bridge |
 | `PoorDS4-status.elf` | Read-only bridge status snapshot |
 | `PoorDS4-stop.elf` | Cooperative stop request |
 
