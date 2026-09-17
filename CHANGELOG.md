@@ -19,6 +19,18 @@ Semantic Versioning; wireless-bridge candidates use `0.1.0-rcN`.
   `global-index-inactive-unique`), cleanly handling games like EA Sports FC 26 and
   Pragmata that preallocate multi-controller tables.
 
+### Fixed
+
+- Seamless in-game Player 2 late join and profile switching:
+  - In-place reader recovery now verifies candidate `user_id` and `pad_index` against previous source identity. When a controller connects mid-match or switches profiles, PoorDS4 cleanly reinstalls the game bridge to the new player slot instead of holding the stale primary slot.
+  - Added active user discovery during disconnect grace: detects secondary user login within 1.0s, breaking early to re-attach immediately.
+  - Reduced disconnect grace from 8.0s to 1.5s, rediscovery timeout from 10.0s to 2.5s, and discovery retry from 5.0s to 0.5s for fast 1.5–2.5s automatic attachment.
+- Universal controller reset shortcut (`L1+R1+L2+R2` held for ~1.5s):
+  - Softened trigger threshold to analog `l2/r2 >= 32u` or digital button bits (`0x100`/`0x200`), allowing gentle trigger pulls to register reliably.
+  - Added decay debouncing (`ticks >= 2 ? ticks - 2 : 0`) across both bridge and supervisor to withstand transient Bluetooth packet loss without wiping progress.
+  - Added reset shortcut evaluation to `scePadGetDataInternal` stub (previously unhandled).
+  - Fixed native passthrough in `scePadReadStateExt` and `scePadReadExt` to invoke actual extended entry points, preventing argument register clearing.
+
 ### Verification
 
 - Live hardware verified on physical PS5 (Model CFI-2016 B01Y, FW 11.600.005)

@@ -994,8 +994,8 @@ game_bridge_is_reset_combo_held(uint32_t buttons, uint8_t l2, uint8_t r2)
 {
     int l1_held = (buttons & 0x00000400u) != 0;
     int r1_held = (buttons & 0x00000800u) != 0;
-    int l2_held = ((buttons & 0x00000100u) != 0) || (l2 >= 128u);
-    int r2_held = ((buttons & 0x00000200u) != 0) || (r2 >= 128u);
+    int l2_held = ((buttons & 0x00000100u) != 0) || (l2 >= 32u);
+    int r2_held = ((buttons & 0x00000200u) != 0) || (r2 >= 32u);
     return l1_held && r1_held && l2_held && r2_held;
 }
 
@@ -1013,11 +1013,12 @@ game_bridge_check_reset_shortcut(GamePadBridgeArgs *args, int32_t handle, void *
         args->reset_ticks[slot] = ticks;
         if ((uint32_t)ticks > args->reset_combo_ticks)
             __atomic_store_n(&args->reset_combo_ticks, (uint32_t)ticks, __ATOMIC_RELAXED);
-        if (ticks >= 120u) {
+        if (ticks >= 90u) {
             __atomic_store_n(&args->reset_requested, 1u, __ATOMIC_RELEASE);
         }
     } else {
-        args->reset_ticks[slot] = 0;
+        uint8_t ticks = args->reset_ticks[slot];
+        args->reset_ticks[slot] = (ticks >= 2u) ? (ticks - 2u) : 0u;
     }
 }
 
@@ -1090,8 +1091,12 @@ int32_t
 game_pad_read_state_ext_stub(int32_t handle, void *out,
                              GamePadBridgeArgs *args)
 {
+    typedef int32_t (*read_state_ext_fn)(int32_t, void *);
     typedef int32_t (*state_internal_fn)(int32_t, void *, int32_t);
-    state_internal_fn original =
+    read_state_ext_fn original_ext =
+        (read_state_ext_fn)(uintptr_t)(
+            args ? args->read_state_ext_address : 0);
+    state_internal_fn fallback_internal =
         (state_internal_fn)(uintptr_t)(
             args ? args->fp_state_internal : 0);
     int native_called = 0;
@@ -1101,9 +1106,14 @@ game_pad_read_state_ext_stub(int32_t handle, void *out,
         game_bridge_handle_matches(args, handle) && out &&
         game_bridge_direct_available(args) &&
         args->pad_size == POORDS4_GAME_BRIDGE_PAD_SIZE) {
-        if (original) {
-            native_result = original(handle, out, 1);
+        if (original_ext) {
+            native_result = original_ext(handle, out);
             native_called = 1;
+        } else if (fallback_internal) {
+            native_result = fallback_internal(handle, out, 1);
+            native_called = 1;
+        }
+        if (native_called) {
             (void)__atomic_fetch_add(
                 &args->native_backing_calls, 1, __ATOMIC_RELAXED);
             if (native_result < 0)
@@ -1138,11 +1148,13 @@ game_pad_read_state_ext_stub(int32_t handle, void *out,
                 final_result = 0;
             else
                 final_result = native_called ? native_result :
-                    (original ? original(handle, out, 1) : native_result);
+                    (original_ext ? original_ext(handle, out) :
+                     (fallback_internal ? fallback_internal(handle, out, 1) : native_result));
         }
     } else {
         final_result = native_called ? native_result :
-            (original ? original(handle, out, 1) : native_result);
+            (original_ext ? original_ext(handle, out) :
+             (fallback_internal ? fallback_internal(handle, out, 1) : native_result));
     }
     if (final_result == 0 && out)
         game_bridge_check_reset_shortcut(args, handle, out);
@@ -1218,8 +1230,12 @@ int32_t
 game_pad_read_ext_stub(int32_t handle, void *out, int32_t num,
                        GamePadBridgeArgs *args)
 {
+    typedef int32_t (*read_ext_fn)(int32_t, void *, int32_t);
     typedef int32_t (*read_internal_fn)(int32_t, void *, int32_t, int32_t);
-    read_internal_fn original =
+    read_ext_fn original_ext =
+        (read_ext_fn)(uintptr_t)(
+            args ? args->read_ext_address : 0);
+    read_internal_fn fallback_internal =
         (read_internal_fn)(uintptr_t)(
             args ? args->fp_read_internal : 0);
     int native_called = 0;
@@ -1229,9 +1245,14 @@ game_pad_read_ext_stub(int32_t handle, void *out, int32_t num,
         game_bridge_handle_matches(args, handle) && out && num > 0 &&
         game_bridge_direct_available(args) &&
         args->pad_size == POORDS4_GAME_BRIDGE_PAD_SIZE) {
-        if (original) {
-            native_result = original(handle, out, num, 1);
+        if (original_ext) {
+            native_result = original_ext(handle, out, num);
             native_called = 1;
+        } else if (fallback_internal) {
+            native_result = fallback_internal(handle, out, num, 1);
+            native_called = 1;
+        }
+        if (native_called) {
             (void)__atomic_fetch_add(
                 &args->native_backing_calls, 1, __ATOMIC_RELAXED);
             if (native_result < 0)
@@ -1266,11 +1287,13 @@ game_pad_read_ext_stub(int32_t handle, void *out, int32_t num,
                 final_result = 1;
             else
                 final_result = native_called ? native_result :
-                    (original ? original(handle, out, num, 1) : native_result);
+                    (original_ext ? original_ext(handle, out, num) :
+                     (fallback_internal ? fallback_internal(handle, out, num, 1) : native_result));
         }
     } else {
         final_result = native_called ? native_result :
-            (original ? original(handle, out, num, 1) : native_result);
+            (original_ext ? original_ext(handle, out, num) :
+             (fallback_internal ? fallback_internal(handle, out, num, 1) : native_result));
     }
     if (final_result > 0 && out)
         game_bridge_check_reset_shortcut(args, handle, out);
@@ -1288,6 +1311,7 @@ game_pad_get_data_internal_stub(int32_t handle, void *out,
             args ? args->fp_data_internal : 0);
     int native_called = 0;
     int32_t native_result = (int32_t)0x80920001u;
+    int32_t final_result = 0;
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
         game_bridge_handle_matches(args, handle) && out &&
         game_bridge_direct_available(args) &&
@@ -1317,22 +1341,27 @@ game_pad_get_data_internal_stub(int32_t handle, void *out,
                 &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
             (void)__atomic_fetch_add(
                 &args->data_internal_calls, 1, __ATOMIC_RELAXED);
-            return native_result;
-        }
-        (void)__atomic_fetch_add(
-            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
-        if (direct_active)
+            final_result = native_result;
+        } else {
             (void)__atomic_fetch_add(
-                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
-        if (game_bridge_copy_direct(
-                args, out, &args->data_internal_calls))
-            return 0;
-        return native_called ? native_result :
+                &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+            if (direct_active)
+                (void)__atomic_fetch_add(
+                    &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
+            if (game_bridge_copy_direct(
+                    args, out, &args->data_internal_calls))
+                final_result = 0;
+            else
+                final_result = native_called ? native_result :
+                    (original ? original(handle, out, 1) : native_result);
+        }
+    } else {
+        final_result = native_called ? native_result :
             (original ? original(handle, out, 1) : native_result);
     }
-    if (native_called)
-        return native_result;
-    return original ? original(handle, out, 1) : native_result;
+    if (final_result == 0 && out)
+        game_bridge_check_reset_shortcut(args, handle, out);
+    return final_result;
 }
 
 /*

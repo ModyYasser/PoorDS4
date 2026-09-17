@@ -27,9 +27,9 @@
 #define GAME_BRIDGE_LOCK_FILE  POORDS4_DATA_DIR "/game-pad-bridge-supervisor.lock"
 #define GAME_BRIDGE_STATE_FILE POORDS4_DATA_DIR "/game-pad-bridge-supervisor.txt"
 #define GAME_BRIDGE_LAUNCH_GRACE_MS UINT64_C(1500)
-#define SOURCE_DISCONNECT_GRACE_MS  UINT64_C(8000)
-#define SOURCE_REDISCOVERY_MS       UINT64_C(10000)
-#define SOURCE_DISCOVERY_RETRY_US   5000000u
+#define SOURCE_DISCONNECT_GRACE_MS  UINT64_C(1500)
+#define SOURCE_REDISCOVERY_MS       UINT64_C(2500)
+#define SOURCE_DISCOVERY_RETRY_US   500000u
 #ifndef GAME_BRIDGE_LOG_LIMIT
 #define GAME_BRIDGE_LOG_LIMIT  (1024u * 1024u)
 #endif
@@ -609,13 +609,16 @@ game_session_end_reason_name(GameSessionEndReason reason)
     return "unknown";
 }
 
+static uint32_t
+collect_user_candidates(int32_t user_ids[POORDS4_MAX_USER_CANDIDATES]);
+
 static inline int
 is_reset_combo_held(uint32_t buttons, uint8_t l2, uint8_t r2)
 {
     int l1_held = (buttons & 0x00000400u) != 0;
     int r1_held = (buttons & 0x00000800u) != 0;
-    int l2_held = ((buttons & 0x00000100u) != 0) || (l2 >= 128u);
-    int r2_held = ((buttons & 0x00000200u) != 0) || (r2 >= 128u);
+    int l2_held = ((buttons & 0x00000100u) != 0) || (l2 >= 32u);
+    int r2_held = ((buttons & 0x00000200u) != 0) || (r2 >= 32u);
     return l1_held && r1_held && l2_held && r2_held;
 }
 
@@ -735,14 +738,17 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
                 have_previous_input = 1;
                 if (is_reset_combo_held(pad.buttons, pad.analogButtons.l2, pad.analogButtons.r2)) {
                     session_reset_combo_ticks++;
-                    if (session_reset_combo_ticks >= 240u) {
+                    if (session_reset_combo_ticks >= 90u) {
                         poords4_log(
                             "[PoorDS4] reset requested via supervisor DS4 stream\n");
                         end_reason = SESSION_END_RESET_REQUESTED;
                         break;
                     }
                 } else {
-                    session_reset_combo_ticks = 0;
+                    if (session_reset_combo_ticks >= 2u)
+                        session_reset_combo_ticks -= 2u;
+                    else
+                        session_reset_combo_ticks = 0;
                 }
                 if (!pad.connected) {
                     uint64_t now = monotonic_milliseconds();
@@ -776,6 +782,29 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
                             (unsigned long long)disconnect_elapsed_ms,
                             disconnect_frames);
                         disconnect_grace_expired = 1;
+                    }
+                    if (now && disconnect_started_ms > 1 &&
+                        disconnect_elapsed_ms >= 1000u) {
+                        int32_t current_users[POORDS4_MAX_USER_CANDIDATES];
+                        memset(current_users, 0xff, sizeof(current_users));
+                        uint32_t current_user_count =
+                            collect_user_candidates(current_users);
+                        int found_other_user = 0;
+                        for (uint32_t u = 0; u < current_user_count; ++u) {
+                            if (current_users[u] >= 0 &&
+                                current_users[u] != g_pad_source.user_id) {
+                                found_other_user = 1;
+                                break;
+                            }
+                        }
+                        if (found_other_user) {
+                            poords4_log(
+                                "[PoorDS4] alternate user active during disconnect "
+                                "elapsed=%llu ms; initiating rediscovery\n",
+                                (unsigned long long)disconnect_elapsed_ms);
+                            end_reason = SESSION_END_READER_FAILED;
+                            break;
+                        }
                     }
                     if (now && disconnect_started_ms > 1 &&
                         disconnect_elapsed_ms >= SOURCE_REDISCOVERY_MS) {
@@ -1132,6 +1161,8 @@ recover_wireless_reader_in_place(
     intptr_t *reader_args, pid_t game_pid, intptr_t bridge_args,
     unsigned sessions, unsigned long long output_frames)
 {
+    int32_t old_user_id = source ? source->user_id : -1;
+    int32_t old_pad_index = source ? source->pad_index : -1;
     uint64_t last_attempt_ms = 0;
     uint64_t last_status_ms = 0;
     unsigned attempts = 0;
@@ -1161,7 +1192,7 @@ recover_wireless_reader_in_place(
         }
 
         if (last_attempt_ms == 0 || now == 0 ||
-            now >= last_attempt_ms + UINT64_C(2000)) {
+            now >= last_attempt_ms + UINT64_C(1000)) {
             int32_t users[POORDS4_MAX_USER_CANDIDATES];
             memset(users, 0xff, sizeof(users));
             uint32_t user_count = collect_user_candidates(users);
@@ -1172,6 +1203,9 @@ recover_wireless_reader_in_place(
             if (wireless_ds4_remote_reader_start(
                     users, user_count, &candidate,
                     &candidate_pid, &candidate_args) == 0) {
+                int user_changed = (old_user_id >= 0 &&
+                    (candidate.user_id != old_user_id ||
+                     candidate.pad_index != old_pad_index));
                 *source = candidate;
                 *reader_pid = candidate_pid;
                 *reader_args = candidate_args;
@@ -1180,10 +1214,10 @@ recover_wireless_reader_in_place(
                 g_pad_source = candidate;
                 poords4_log(
                     "[PoorDS4] in-place reader recovery complete "
-                    "attempts=%u user=0x%08x index=%d\n",
+                    "attempts=%u user=0x%08x index=%d user_changed=%d\n",
                     attempts, (uint32_t)candidate.user_id,
-                    candidate.pad_index);
-                return 0;
+                    candidate.pad_index, user_changed);
+                return user_changed ? 1 : 0;
             }
             last_attempt_ms = now;
             if (attempts == 1 || (attempts % 10u) == 0)
@@ -1594,16 +1628,45 @@ main(void)
                 reader_args = 0;
                 g_reader_pid = -1;
                 g_reader_args = 0;
-                if (recover_wireless_reader_in_place(
-                        &g_pad_source, &reader_pid, &reader_args,
-                        game_pid, bridge_args, sessions,
-                        total_output_frames) == 0) {
+                int recovery_result = recover_wireless_reader_in_place(
+                    &g_pad_source, &reader_pid, &reader_args,
+                    game_pid, bridge_args, sessions,
+                    total_output_frames);
+                if (recovery_result == 0) {
                     reader_restart_required = 0;
                     poords4_log(
                         "[PoorDS4] wireless reader recovered; "
                         "continuing current game without reinstall\n");
                     end_reason = SESSION_END_STOP_REQUESTED;
                     continue;
+                }
+                if (recovery_result == 1) {
+                    poords4_log(
+                        "[PoorDS4] wireless reader recovered on new user/slot; "
+                        "reinstalling game bridge\n");
+                    const char *recovery_cleanup_mode = NULL;
+                    int recovery_cleanup = teardown_game_bridge(
+                        game_pid, bridge_args, !g_skip_remote_cleanup,
+                        &recovery_cleanup_mode);
+                    poords4_log(
+                        "[PoorDS4] user switch bridge cleanup=%s result=%d\n",
+                        recovery_cleanup_mode
+                            ? recovery_cleanup_mode : "unknown",
+                        recovery_cleanup);
+                    reader_restart_required = 0;
+                    launch_candidate_pid = -1;
+                    launch_candidate_since_ms = 0;
+                    retry_pid = -1;
+                    install_retries = 0;
+                    if (process_alive(game_pid) && recovery_cleanup != 0)
+                        end_reason = SESSION_END_CLEANUP_FAILED;
+                    else if (!process_alive(game_pid))
+                        end_reason = SESSION_END_GAME_EXITED;
+                    else if (lifecycle_should_stop())
+                        end_reason = SESSION_END_LIFECYCLE;
+                    else
+                        end_reason = SESSION_END_READER_FAILED;
+                    break;
                 }
             }
 
