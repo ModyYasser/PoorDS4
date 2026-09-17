@@ -3,6 +3,21 @@
 All notable changes to this project are documented here. Release tags follow
 Semantic Versioning; wireless-bridge candidates use `0.1.0-rcN`.
 
+## [0.1.0-rc44] - 2026-09-17
+
+### Fixed
+
+- **Late-Join DualSense Slot Stealing Prevention**:
+  - In `game_bridge_select_pad_handle()`, Rule 9 ("sole-entry") now verifies that the active entry is not a native DualSense (`0x054c:0x0ce6`) or DualSense Edge (`0x054c:0x0df2`). When a secondary DS4 connects mid-game in titles like FC 26 where Player 1 is on native DualSense and Player 2's slot is not yet opened, PoorDS4 avoids stealing Slot 0 and instead waits for Player 2's slot to be created.
+  - Reduced polling retry delay for `waiting_for_game_pad_handle` (`install_result == -4`) from 1.0–5.0s down to 200ms with a 300-retry limit (60s total window), hooking Player 2 within 200ms of slot allocation.
+- **Universal Controller Reset Shortcut (`L1+R1+L2+R2` for ~1.25s)**:
+  - Clamped in-game pad slot indexing to `(handle & 0xff) % 4u` to ensure valid per-slot tracking across high handle descriptors.
+  - Lowered trigger threshold to 75 ticks (~1.25s at 60Hz) with 2-tick decay debouncing across both DS4 reader stream and in-game hooks.
+  - Accelerated reader status polling from 1000ms down to 250ms in the session supervisor, catching controller reset requests within 250ms.
+  - Fixed in-place reader recovery to poll bridge status every 100ms and immediately process `reset_requested` (`return -4`), allowing the shortcut on DualSense to trigger a clean payload reset even while the wireless DS4 is disconnected.
+- **Payload Stability & Teardown Hygiene**:
+  - Eliminated redundant `teardown_game_bridge()` invocations on `SESSION_END_RESET_REQUESTED` and `SESSION_END_BRIDGE_HEALTH_FAILED`, preventing `remove refused non-passive layout` / `result=-1` warnings during recovery cycles.
+
 ## [0.1.0-rc43] - 2026-09-17
 
 ### Added

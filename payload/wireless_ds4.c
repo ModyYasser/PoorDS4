@@ -662,19 +662,22 @@ remote_pad_reader_stub(void *arg)
             int l1_held = (pad->buttons & 0x00000400u) != 0;
             int r1_held = (pad->buttons & 0x00000800u) != 0;
             int l2_held = ((pad->buttons & 0x00000100u) != 0) ||
-                (pad->analogButtons.l2 >= 128u);
+                (pad->analogButtons.l2 >= 32u);
             int r2_held = ((pad->buttons & 0x00000200u) != 0) ||
-                (pad->analogButtons.r2 >= 128u);
+                (pad->analogButtons.r2 >= 32u);
             if (l1_held && r1_held && l2_held && r2_held) {
                 uint16_t ticks = a->reset_combo_ticks;
                 if (ticks < 65535u)
                     ticks++;
                 a->reset_combo_ticks = ticks;
-                if (ticks >= 240u)
+                if (ticks >= 120u)
                     __atomic_store_n(
                         &a->reset_requested, 1u, __ATOMIC_RELEASE);
             } else {
-                a->reset_combo_ticks = 0;
+                if (a->reset_combo_ticks >= 2u)
+                    a->reset_combo_ticks -= 2u;
+                else
+                    a->reset_combo_ticks = 0;
             }
         }
         __atomic_store_n(&a->last_result, result, __ATOMIC_RELAXED);
@@ -1005,7 +1008,9 @@ game_bridge_check_reset_shortcut(GamePadBridgeArgs *args, int32_t handle, void *
     if (!args || !out || handle < 0)
         return;
     const ScePadData *pad = (const ScePadData *)out;
-    uint32_t slot = (uint32_t)(handle & 3);
+    uint32_t slot = (uint32_t)(handle & 0xff);
+    if (slot >= 4u)
+        slot = slot % 4u;
     if (game_bridge_is_reset_combo_held(pad->buttons, pad->analogButtons.l2, pad->analogButtons.r2)) {
         uint8_t ticks = args->reset_ticks[slot];
         if (ticks < 255u)
@@ -1013,7 +1018,7 @@ game_bridge_check_reset_shortcut(GamePadBridgeArgs *args, int32_t handle, void *
         args->reset_ticks[slot] = ticks;
         if ((uint32_t)ticks > args->reset_combo_ticks)
             __atomic_store_n(&args->reset_combo_ticks, (uint32_t)ticks, __ATOMIC_RELAXED);
-        if (ticks >= 90u) {
+        if (ticks >= 75u) {
             __atomic_store_n(&args->reset_requested, 1u, __ATOMIC_RELEASE);
         }
     } else {
@@ -3692,6 +3697,8 @@ game_bridge_select_pad_handle(
 
     int32_t sole_handle = -1;
     int32_t sole_index = -1;
+    uint16_t sole_vendor = 0;
+    uint16_t sole_product = 0;
     int32_t unique_ds4_handle = -1;
     int32_t unique_ds4_index = -1;
     int32_t unique_inactive_handle = -1;
@@ -3798,6 +3805,8 @@ game_bridge_select_pad_handle(
         active_count++;
         sole_handle = handle;
         sole_index = inferred_index;
+        sole_vendor = vendor;
+        sole_product = product;
         if (is_ds4) {
             ds4_count++;
             unique_ds4_handle = handle;
@@ -3894,7 +3903,10 @@ game_bridge_select_pad_handle(
         *out_index = global_inactive_first_index;
         method = "global-inactive-first";
     } else if (ds4_count == 0u && inactive_count == 0u &&
-               active_count == 1u && identity_count == 1u) {
+               active_count == 1u && identity_count == 1u &&
+               (sole_vendor != UINT16_C(0x054c) ||
+                (sole_product != UINT16_C(0x0ce6) &&
+                 sole_product != UINT16_C(0x0df2)))) {
         *out_handle = sole_handle;
         *out_index = sole_index;
         method = "sole-entry";

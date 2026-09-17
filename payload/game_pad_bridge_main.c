@@ -943,13 +943,13 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
                     consecutive_bridge_health_failures++;
                 }
             }
-        }
-        if ((loop_count % 120u) == 0) {
             PoorDS4RemoteReaderStatus reader_status;
             memset(&reader_status, 0, sizeof(reader_status));
             if (wireless_ds4_remote_reader_status(
                     reader_pid, reader_args, &reader_status) == 0)
                 last_reader_status = reader_status;
+        }
+        if ((loop_count % 120u) == 0) {
             errno = 0;
             game_alive = kill(game_pid, 0) == 0 || errno == EPERM;
         }
@@ -1181,18 +1181,23 @@ recover_wireless_reader_in_place(
 
         uint64_t now = monotonic_milliseconds();
         if (last_status_ms == 0 || now == 0 ||
-            now >= last_status_ms + UINT64_C(1000)) {
+            now >= last_status_ms + UINT64_C(100)) {
             PoorDS4GameBridgeStatus status;
             memset(&status, 0, sizeof(status));
             if (wireless_ds4_game_bridge_status(
                     game_pid, bridge_args, &status) != 0 ||
                 status.bridge_ready != 1 || !status.active)
                 return -1;
+            if (status.reset_requested != 0) {
+                poords4_log(
+                    "[PoorDS4] reset shortcut detected during reader recovery\n");
+                return -4;
+            }
             last_status_ms = now;
         }
 
         if (last_attempt_ms == 0 || now == 0 ||
-            now >= last_attempt_ms + UINT64_C(1000)) {
+            now >= last_attempt_ms + UINT64_C(250)) {
             int32_t users[POORDS4_MAX_USER_CANDIDATES];
             memset(users, 0xff, sizeof(users));
             uint32_t user_count = collect_user_candidates(users);
@@ -1228,7 +1233,7 @@ recover_wireless_reader_in_place(
         write_supervisor_state(
             "recovering_wireless_controller", game_pid,
             sessions, output_frames, 0);
-        if (sleep_interruptible(100000) != 0)
+        if (sleep_interruptible(50000) != 0)
             return -3;
     }
 }
@@ -1492,13 +1497,20 @@ main(void)
                  * install rolls back hooks and its anonymous mapping, so a
                  * short bounded retry is safe. */
                 unsigned retry_limit = install_result == -4
-                    ? 120u : (install_result == 0 ? 5u : 15u);
-                if (install_result == -4 || install_retries <= retry_limit) {
-                    unsigned retry_delay_us = install_retries <= 3u
-                        ? 1000000u
-                        : (install_retries <= 15u
-                            ? 2000000u : 5000000u);
-                    if ((install_retries % 10u) == 0 || install_retries <= 5u) {
+                    ? 300u : (install_result == 0 ? 5u : 15u);
+                if (install_retries <= retry_limit) {
+                    unsigned retry_delay_us;
+                    if (install_result == -4) {
+                        retry_delay_us = 200000u;
+                    } else if (install_retries <= 3u) {
+                        retry_delay_us = 1000000u;
+                    } else if (install_retries <= 15u) {
+                        retry_delay_us = 2000000u;
+                    } else {
+                        retry_delay_us = 5000000u;
+                    }
+                    if ((install_result == -4 && (install_retries % 25u) == 0) ||
+                        (install_result != -4 && ((install_retries % 10u) == 0 || install_retries <= 5u))) {
                         poords4_log(
                             "[PoorDS4] game not ready pid=%d result=%d "
                             "retry=%u/%u delay_ms=%u\n",
@@ -1654,8 +1666,8 @@ main(void)
                             ? recovery_cleanup_mode : "unknown",
                         recovery_cleanup);
                     reader_restart_required = 0;
-                    launch_candidate_pid = -1;
-                    launch_candidate_since_ms = 0;
+                    launch_candidate_pid = game_pid;
+                    launch_candidate_since_ms = 1;
                     retry_pid = -1;
                     install_retries = 0;
                     if (process_alive(game_pid) && recovery_cleanup != 0)
@@ -1666,6 +1678,21 @@ main(void)
                         end_reason = SESSION_END_LIFECYCLE;
                     else
                         end_reason = SESSION_END_READER_FAILED;
+                    break;
+                }
+                if (recovery_result == -4) {
+                    poords4_log(
+                        "[PoorDS4] reset shortcut detected during reader recovery pid=%d\n",
+                        game_pid);
+                    const char *reset_cleanup_mode = NULL;
+                    int reset_cleanup = teardown_game_bridge(
+                        game_pid, bridge_args, !g_skip_remote_cleanup,
+                        &reset_cleanup_mode);
+                    poords4_log(
+                        "[PoorDS4] recovery reset bridge cleanup=%s result=%d\n",
+                        reset_cleanup_mode ? reset_cleanup_mode : "unknown",
+                        reset_cleanup);
+                    end_reason = SESSION_END_RESET_REQUESTED;
                     break;
                 }
             }
@@ -1732,8 +1759,24 @@ main(void)
             g_reader_args = 0;
             g_pad_source = (PoorDS4PadSource){-1, -1, -1, 0};
             reader_restart_required = 1;
-            launch_candidate_pid = -1;
-            launch_candidate_since_ms = 0;
+            launch_candidate_pid = game_pid;
+            launch_candidate_since_ms = 1;
+            retry_pid = -1;
+            install_retries = 0;
+            sleep_interruptible(250000);
+            continue;
+        }
+        if ((end_reason == SESSION_END_BRIDGE_HEALTH_FAILED ||
+             end_reason == SESSION_END_WRITER_FAILED) &&
+            process_alive(game_pid)) {
+            poords4_log(
+                "[PoorDS4] bridge health/writer error reason=%d (%s); "
+                "recovering pid=%d\n",
+                end_reason, game_session_end_reason_name(end_reason),
+                game_pid);
+            reader_restart_required = 1;
+            launch_candidate_pid = game_pid;
+            launch_candidate_since_ms = 1;
             retry_pid = -1;
             install_retries = 0;
             sleep_interruptible(500000);
