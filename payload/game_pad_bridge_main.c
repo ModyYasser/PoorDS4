@@ -900,6 +900,21 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
             last_health_frame = input_frames;
         }
         loop_count++;
+        if ((loop_count % 30u) == 0) {
+            if (game_alive) {
+                PoorDS4GameBridgeStatus bridge_status;
+                memset(&bridge_status, 0, sizeof(bridge_status));
+                if (wireless_ds4_game_bridge_status(
+                        game_pid, bridge_args, &bridge_status) == 0 &&
+                    bridge_status.bridge_ready == 1) {
+                    last_bridge_status = bridge_status;
+                    if ((loop_count % 120u) == 0)
+                        consecutive_bridge_health_failures = 0;
+                } else if ((loop_count % 120u) == 0) {
+                    consecutive_bridge_health_failures++;
+                }
+            }
+        }
         if ((loop_count % 120u) == 0) {
             PoorDS4RemoteReaderStatus reader_status;
             memset(&reader_status, 0, sizeof(reader_status));
@@ -908,20 +923,6 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
                 last_reader_status = reader_status;
             errno = 0;
             game_alive = kill(game_pid, 0) == 0 || errno == EPERM;
-            /* Never copy from a PID once kill(2) says it is gone. RC22 did
-             * exactly that, then tried ptrace cleanup on the dead game. */
-            if (game_alive) {
-                PoorDS4GameBridgeStatus bridge_status;
-                memset(&bridge_status, 0, sizeof(bridge_status));
-                if (wireless_ds4_game_bridge_status(
-                        game_pid, bridge_args, &bridge_status) == 0 &&
-                    bridge_status.bridge_ready == 1) {
-                    last_bridge_status = bridge_status;
-                    consecutive_bridge_health_failures = 0;
-                } else {
-                    consecutive_bridge_health_failures++;
-                }
-            }
         }
         if (last_bridge_status.reset_requested || last_reader_status.reset_requested) {
             poords4_log(

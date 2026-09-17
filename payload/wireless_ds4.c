@@ -3881,6 +3881,11 @@ game_bridge_select_pad_handle(
         indexed_ds4_count,
         indexed_inactive_count, identity_count,
         identity_inactive_count);
+    klog_printf(
+        "[PoorDS4] pad selection: method=%s handle=0x%08x index=%d "
+        "active=%u ds4=%u inactive=%u identity=%u\n",
+        method, (uint32_t)*out_handle, *out_index,
+        active_count, ds4_count, inactive_count, identity_count);
     return *out_handle >= 0 ? 0 : -1;
 }
 
