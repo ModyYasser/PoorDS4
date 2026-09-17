@@ -50,6 +50,8 @@ typedef struct {
     uint8_t count;
     uint8_t reserved0;
     uint64_t timestamp;
+    uint32_t reset_combo_ticks;
+    uint32_t reset_requested;
 } PoorDS4RemoteReaderStatus;
 
 int wireless_ds4_remote_reader_status(
@@ -105,6 +107,8 @@ typedef struct {
     int32_t game_pad_index;
     uint32_t buttons;
     uint8_t connected;
+    uint32_t reset_combo_ticks;
+    uint32_t reset_requested;
 } PoorDS4GameBridgeStatus;
 
 int wireless_ds4_game_bridge_status(pid_t game_pid, intptr_t args_address,

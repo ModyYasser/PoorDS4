@@ -581,7 +581,8 @@ typedef enum {
     SESSION_END_WRITER_FAILED = 3,
     SESSION_END_BRIDGE_HEALTH_FAILED = 4,
     SESSION_END_LIFECYCLE = 5,
-    SESSION_END_CLEANUP_FAILED = 6
+    SESSION_END_CLEANUP_FAILED = 6,
+    SESSION_END_RESET_REQUESTED = 7
 } GameSessionEndReason;
 
 static const char *
@@ -602,8 +603,20 @@ game_session_end_reason_name(GameSessionEndReason reason)
         return "lifecycle";
     case SESSION_END_CLEANUP_FAILED:
         return "cleanup_failed";
+    case SESSION_END_RESET_REQUESTED:
+        return "reset_requested";
     }
     return "unknown";
+}
+
+static inline int
+is_reset_combo_held(uint32_t buttons, uint8_t l2, uint8_t r2)
+{
+    int l1_held = (buttons & 0x00000400u) != 0;
+    int r1_held = (buttons & 0x00000800u) != 0;
+    int l2_held = ((buttons & 0x00000100u) != 0) || (l2 >= 128u);
+    int r2_held = ((buttons & 0x00000200u) != 0) || (r2 >= 128u);
+    return l1_held && r1_held && l2_held && r2_held;
 }
 
 static void
@@ -660,6 +673,7 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
     PoorDS4RemoteReaderStatus last_reader_status;
     memset(&last_reader_status, 0, sizeof(last_reader_status));
     int game_alive = 1;
+    uint32_t session_reset_combo_ticks = 0;
     GameSessionEndReason end_reason = SESSION_END_STOP_REQUESTED;
     write_supervisor_state(
         "active", game_pid, session, previous_output_frames, 1);
@@ -719,6 +733,17 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
                 previous_l2 = pad.analogButtons.l2;
                 previous_r2 = pad.analogButtons.r2;
                 have_previous_input = 1;
+                if (is_reset_combo_held(pad.buttons, pad.analogButtons.l2, pad.analogButtons.r2)) {
+                    session_reset_combo_ticks++;
+                    if (session_reset_combo_ticks >= 240u) {
+                        poords4_log(
+                            "[PoorDS4] reset requested via supervisor DS4 stream\n");
+                        end_reason = SESSION_END_RESET_REQUESTED;
+                        break;
+                    }
+                } else {
+                    session_reset_combo_ticks = 0;
+                }
                 if (!pad.connected) {
                     uint64_t now = monotonic_milliseconds();
                     if (disconnect_started_ms == 0) {
@@ -897,6 +922,14 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
                     consecutive_bridge_health_failures++;
                 }
             }
+        }
+        if (last_bridge_status.reset_requested || last_reader_status.reset_requested) {
+            poords4_log(
+                "[PoorDS4] reset requested via status bridge=%u reader=%u\n",
+                last_bridge_status.reset_requested,
+                last_reader_status.reset_requested);
+            end_reason = SESSION_END_RESET_REQUESTED;
+            break;
         }
         if (consecutive_read_failures >= 240u ||
             consecutive_write_failures >= 1200u ||
@@ -1333,6 +1366,16 @@ main(void)
             }
         }
 
+        if (reader_preflight.reset_requested) {
+            poords4_log(
+                "[PoorDS4] reset requested while waiting for game\n");
+            game_bridge_notify(
+                "PoorDS4: reset requested via controller shortcut");
+            reader_restart_required = 1;
+            sleep_interruptible(500000);
+            continue;
+        }
+
         pid_t observed_game_pid = -1;
         int find_result = wireless_ds4_game_bridge_find_target(
             &observed_game_pid);
@@ -1415,16 +1458,18 @@ main(void)
                  * short bounded retry is safe. */
                 unsigned retry_limit = install_result == -4
                     ? 120u : (install_result == 0 ? 5u : 15u);
-                if (install_retries <= retry_limit) {
+                if (install_result == -4 || install_retries <= retry_limit) {
                     unsigned retry_delay_us = install_retries <= 3u
                         ? 1000000u
                         : (install_retries <= 15u
                             ? 2000000u : 5000000u);
-                    poords4_log(
-                        "[PoorDS4] game not ready pid=%d result=%d "
-                        "retry=%u/%u delay_ms=%u\n",
-                        game_pid, install_result, install_retries,
-                        retry_limit, retry_delay_us / 1000u);
+                    if ((install_retries % 10u) == 0 || install_retries <= 5u) {
+                        poords4_log(
+                            "[PoorDS4] game not ready pid=%d result=%d "
+                            "retry=%u/%u delay_ms=%u\n",
+                            game_pid, install_result, install_retries,
+                            retry_limit, retry_delay_us / 1000u);
+                    }
                     write_supervisor_state(
                         "waiting_game_ready", game_pid, sessions,
                         total_output_frames, 0);
@@ -1602,6 +1647,32 @@ main(void)
                 "[PoorDS4] reader unavailable after clean bridge removal; "
                 "restoring before reinstall pid=%d\n",
                 game_pid);
+            continue;
+        }
+        if (end_reason == SESSION_END_RESET_REQUESTED &&
+            process_alive(game_pid)) {
+            poords4_log(
+                "[PoorDS4] controller reset shortcut triggered; "
+                "resetting reader and re-attaching pid=%d\n",
+                game_pid);
+            game_bridge_notify(
+                "PoorDS4: reset requested via controller shortcut");
+            if (reader_pid > 0 && reader_args != 0 &&
+                process_alive(reader_pid)) {
+                (void)wireless_ds4_remote_reader_stop(
+                    reader_pid, reader_args);
+            }
+            reader_pid = -1;
+            reader_args = 0;
+            g_reader_pid = -1;
+            g_reader_args = 0;
+            g_pad_source = (PoorDS4PadSource){-1, -1, -1, 0};
+            reader_restart_required = 1;
+            launch_candidate_pid = -1;
+            launch_candidate_since_ms = 0;
+            retry_pid = -1;
+            install_retries = 0;
+            sleep_interruptible(500000);
             continue;
         }
         poords4_log(

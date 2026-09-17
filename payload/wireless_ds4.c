@@ -572,7 +572,8 @@ typedef struct {
     uint32_t owner_check_interval;
     volatile uint32_t owner_miss_count;
     volatile uint32_t owner_watchdog_exits;
-    uint32_t reserved;
+    volatile uint16_t reset_combo_ticks;
+    volatile uint16_t reset_requested;
     /* Appended source ABI: older firmware can expose a live pad through the
      * queued read path while a secondary thread's state cache remains idle. */
     intptr_t fp_read;
@@ -654,6 +655,27 @@ remote_pad_reader_stub(void *arg)
             (void)__atomic_fetch_add(
                 &a->state_fallback_frames, 1,
                 __ATOMIC_RELAXED);
+        }
+        if (result == 0) {
+            const ScePadData *pad =
+                (const ScePadData *)(const void *)a->pad_data;
+            int l1_held = (pad->buttons & 0x00000400u) != 0;
+            int r1_held = (pad->buttons & 0x00000800u) != 0;
+            int l2_held = ((pad->buttons & 0x00000100u) != 0) ||
+                (pad->analogButtons.l2 >= 128u);
+            int r2_held = ((pad->buttons & 0x00000200u) != 0) ||
+                (pad->analogButtons.r2 >= 128u);
+            if (l1_held && r1_held && l2_held && r2_held) {
+                uint16_t ticks = a->reset_combo_ticks;
+                if (ticks < 65535u)
+                    ticks++;
+                a->reset_combo_ticks = ticks;
+                if (ticks >= 240u)
+                    __atomic_store_n(
+                        &a->reset_requested, 1u, __ATOMIC_RELEASE);
+            } else {
+                a->reset_combo_ticks = 0;
+            }
         }
         __atomic_store_n(&a->last_result, result, __ATOMIC_RELAXED);
         __atomic_store_n(&a->seq, odd + 1u, __ATOMIC_RELEASE);
@@ -758,7 +780,7 @@ typedef struct {
     volatile uint64_t legacy_receiver_timeouts;
     volatile uint64_t lease_expirations;
     volatile uint32_t legacy_receiver_timeout_streak;
-    uint32_t reserved2;
+    volatile uint8_t reset_ticks[4];
     /* RC31 diagnostics for one-frame continuity protection. */
     volatile uint64_t snapshot_contention_fallbacks;
     volatile uint64_t controller_info_result_overrides;
@@ -767,7 +789,7 @@ typedef struct {
     /* RC33 redirects caller-owned PLT/GOT slots instead of modifying
      * libScePad text.  The saved entries make removal transactional. */
     uint32_t import_hook_count;
-    uint32_t import_hook_reserved;
+    volatile uint32_t reset_combo_ticks;
     intptr_t import_hook_slots[POORDS4_GAME_BRIDGE_MAX_IMPORT_HOOKS];
     intptr_t import_hook_originals[POORDS4_GAME_BRIDGE_MAX_IMPORT_HOOKS];
     intptr_t import_hook_gateways[POORDS4_GAME_BRIDGE_MAX_IMPORT_HOOKS];
@@ -789,7 +811,7 @@ typedef struct {
     volatile uint64_t direct_fallback_frames;
     volatile uint64_t direct_active_fallbacks;
     volatile int32_t last_native_result;
-    uint32_t path_reserved;
+    volatile uint32_t reset_requested;
     volatile uint64_t native_success_frames;
     volatile uint64_t native_input_activity_frames;
     volatile uint64_t last_native_timestamp;
@@ -967,6 +989,38 @@ game_bridge_record_native(GamePadBridgeArgs *args, void *out)
                      __ATOMIC_RELAXED);
 }
 
+static __attribute__((always_inline)) inline int
+game_bridge_is_reset_combo_held(uint32_t buttons, uint8_t l2, uint8_t r2)
+{
+    int l1_held = (buttons & 0x00000400u) != 0;
+    int r1_held = (buttons & 0x00000800u) != 0;
+    int l2_held = ((buttons & 0x00000100u) != 0) || (l2 >= 128u);
+    int r2_held = ((buttons & 0x00000200u) != 0) || (r2 >= 128u);
+    return l1_held && r1_held && l2_held && r2_held;
+}
+
+static __attribute__((always_inline)) inline void
+game_bridge_check_reset_shortcut(GamePadBridgeArgs *args, int32_t handle, void *out)
+{
+    if (!args || !out || handle < 0)
+        return;
+    const ScePadData *pad = (const ScePadData *)out;
+    uint32_t slot = (uint32_t)(handle & 3);
+    if (game_bridge_is_reset_combo_held(pad->buttons, pad->analogButtons.l2, pad->analogButtons.r2)) {
+        uint8_t ticks = args->reset_ticks[slot];
+        if (ticks < 255u)
+            ticks++;
+        args->reset_ticks[slot] = ticks;
+        if ((uint32_t)ticks > args->reset_combo_ticks)
+            __atomic_store_n(&args->reset_combo_ticks, (uint32_t)ticks, __ATOMIC_RELAXED);
+        if (ticks >= 120u) {
+            __atomic_store_n(&args->reset_requested, 1u, __ATOMIC_RELEASE);
+        }
+    } else {
+        args->reset_ticks[slot] = 0;
+    }
+}
+
 __attribute__((noinline, used, section(".text.ds4gamebridge")))
 int32_t
 game_pad_read_state_stub(int32_t handle, void *out,
@@ -978,6 +1032,7 @@ game_pad_read_state_stub(int32_t handle, void *out,
             args ? args->fp_state_internal : 0);
     int native_called = 0;
     int32_t native_result = (int32_t)0x80920001u;
+    int32_t final_result = 0;
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
         game_bridge_handle_matches(args, handle) && out &&
         game_bridge_direct_available(args) &&
@@ -1007,22 +1062,27 @@ game_pad_read_state_stub(int32_t handle, void *out,
                 &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
             (void)__atomic_fetch_add(
                 &args->read_state_calls, 1, __ATOMIC_RELAXED);
-            return native_result;
-        }
-        (void)__atomic_fetch_add(
-            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
-        if (direct_active)
+            final_result = native_result;
+        } else {
             (void)__atomic_fetch_add(
-                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
-        if (game_bridge_copy_direct(
-                args, out, &args->read_state_calls))
-            return 0;
-        return native_called ? native_result :
+                &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+            if (direct_active)
+                (void)__atomic_fetch_add(
+                    &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
+            if (game_bridge_copy_direct(
+                    args, out, &args->read_state_calls))
+                final_result = 0;
+            else
+                final_result = native_called ? native_result :
+                    (original ? original(handle, out, 0) : native_result);
+        }
+    } else {
+        final_result = native_called ? native_result :
             (original ? original(handle, out, 0) : native_result);
     }
-    if (native_called)
-        return native_result;
-    return original ? original(handle, out, 0) : native_result;
+    if (final_result == 0 && out)
+        game_bridge_check_reset_shortcut(args, handle, out);
+    return final_result;
 }
 
 __attribute__((noinline, used, section(".text.ds4gamebridge")))
@@ -1036,6 +1096,7 @@ game_pad_read_state_ext_stub(int32_t handle, void *out,
             args ? args->fp_state_internal : 0);
     int native_called = 0;
     int32_t native_result = (int32_t)0x80920001u;
+    int32_t final_result = 0;
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
         game_bridge_handle_matches(args, handle) && out &&
         game_bridge_direct_available(args) &&
@@ -1065,22 +1126,27 @@ game_pad_read_state_ext_stub(int32_t handle, void *out,
                 &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
             (void)__atomic_fetch_add(
                 &args->read_state_ext_calls, 1, __ATOMIC_RELAXED);
-            return native_result;
-        }
-        (void)__atomic_fetch_add(
-            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
-        if (direct_active)
+            final_result = native_result;
+        } else {
             (void)__atomic_fetch_add(
-                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
-        if (game_bridge_copy_direct(
-                args, out, &args->read_state_ext_calls))
-            return 0;
-        return native_called ? native_result :
+                &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+            if (direct_active)
+                (void)__atomic_fetch_add(
+                    &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
+            if (game_bridge_copy_direct(
+                    args, out, &args->read_state_ext_calls))
+                final_result = 0;
+            else
+                final_result = native_called ? native_result :
+                    (original ? original(handle, out, 1) : native_result);
+        }
+    } else {
+        final_result = native_called ? native_result :
             (original ? original(handle, out, 1) : native_result);
     }
-    if (native_called)
-        return native_result;
-    return original ? original(handle, out, 1) : native_result;
+    if (final_result == 0 && out)
+        game_bridge_check_reset_shortcut(args, handle, out);
+    return final_result;
 }
 
 __attribute__((noinline, used, section(".text.ds4gamebridge")))
@@ -1094,6 +1160,7 @@ game_pad_read_stub(int32_t handle, void *out, int32_t num,
             args ? args->fp_read_internal : 0);
     int native_called = 0;
     int32_t native_result = (int32_t)0x80920001u;
+    int32_t final_result = 0;
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
         game_bridge_handle_matches(args, handle) && out && num > 0 &&
         game_bridge_direct_available(args) &&
@@ -1123,22 +1190,27 @@ game_pad_read_stub(int32_t handle, void *out, int32_t num,
                 &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
             (void)__atomic_fetch_add(
                 &args->read_calls, 1, __ATOMIC_RELAXED);
-            return native_result;
-        }
-        (void)__atomic_fetch_add(
-            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
-        if (direct_active)
+            final_result = native_result;
+        } else {
             (void)__atomic_fetch_add(
-                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
-        if (game_bridge_copy_direct(
-                args, out, &args->read_calls))
-            return 1;
-        return native_called ? native_result :
+                &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+            if (direct_active)
+                (void)__atomic_fetch_add(
+                    &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
+            if (game_bridge_copy_direct(
+                    args, out, &args->read_calls))
+                final_result = 1;
+            else
+                final_result = native_called ? native_result :
+                    (original ? original(handle, out, num, 0) : native_result);
+        }
+    } else {
+        final_result = native_called ? native_result :
             (original ? original(handle, out, num, 0) : native_result);
     }
-    if (native_called)
-        return native_result;
-    return original ? original(handle, out, num, 0) : native_result;
+    if (final_result > 0 && out)
+        game_bridge_check_reset_shortcut(args, handle, out);
+    return final_result;
 }
 
 __attribute__((noinline, used, section(".text.ds4gamebridge")))
@@ -1152,6 +1224,7 @@ game_pad_read_ext_stub(int32_t handle, void *out, int32_t num,
             args ? args->fp_read_internal : 0);
     int native_called = 0;
     int32_t native_result = (int32_t)0x80920001u;
+    int32_t final_result = 0;
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
         game_bridge_handle_matches(args, handle) && out && num > 0 &&
         game_bridge_direct_available(args) &&
@@ -1181,22 +1254,27 @@ game_pad_read_ext_stub(int32_t handle, void *out, int32_t num,
                 &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
             (void)__atomic_fetch_add(
                 &args->read_ext_calls, 1, __ATOMIC_RELAXED);
-            return native_result;
-        }
-        (void)__atomic_fetch_add(
-            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
-        if (direct_active)
+            final_result = native_result;
+        } else {
             (void)__atomic_fetch_add(
-                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
-        if (game_bridge_copy_direct(
-                args, out, &args->read_ext_calls))
-            return 1;
-        return native_called ? native_result :
+                &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+            if (direct_active)
+                (void)__atomic_fetch_add(
+                    &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
+            if (game_bridge_copy_direct(
+                    args, out, &args->read_ext_calls))
+                final_result = 1;
+            else
+                final_result = native_called ? native_result :
+                    (original ? original(handle, out, num, 1) : native_result);
+        }
+    } else {
+        final_result = native_called ? native_result :
             (original ? original(handle, out, num, 1) : native_result);
     }
-    if (native_called)
-        return native_result;
-    return original ? original(handle, out, num, 1) : native_result;
+    if (final_result > 0 && out)
+        game_bridge_check_reset_shortcut(args, handle, out);
+    return final_result;
 }
 
 __attribute__((noinline, used, section(".text.ds4gamebridge")))
@@ -2511,6 +2589,8 @@ wireless_ds4_remote_reader_status(
         out_status->count = pad->count;
         out_status->timestamp = pad->timestamp;
     }
+    out_status->reset_combo_ticks = (uint32_t)snapshot.reset_combo_ticks;
+    out_status->reset_requested = (uint32_t)snapshot.reset_requested;
     return 0;
 #endif
 }
@@ -3591,6 +3671,10 @@ game_bridge_select_pad_handle(
     int32_t identity_inactive_index = -1;
     int32_t source_user_inactive_handle = -1;
     int32_t source_user_inactive_index = -1;
+    int32_t source_user_inactive_first_handle = -1;
+    int32_t source_user_inactive_first_index = -1;
+    int32_t global_inactive_first_handle = -1;
+    int32_t global_inactive_first_index = -1;
     int32_t source_index_inactive_handle = -1;
     int32_t source_index_inactive_index = -1;
     unsigned active_count = 0;
@@ -3694,6 +3778,11 @@ game_bridge_select_pad_handle(
             inactive_count++;
             unique_inactive_handle = handle;
             unique_inactive_index = inferred_index;
+            if (global_inactive_first_handle < 0 ||
+                inferred_index < global_inactive_first_index) {
+                global_inactive_first_handle = handle;
+                global_inactive_first_index = inferred_index;
+            }
         }
         if (matches_index) {
             indexed_count++;
@@ -3710,6 +3799,11 @@ game_bridge_select_pad_handle(
                 source_user_inactive_count++;
                 source_user_inactive_handle = handle;
                 source_user_inactive_index = inferred_index;
+                if (source_user_inactive_first_handle < 0 ||
+                    inferred_index < source_user_inactive_first_index) {
+                    source_user_inactive_first_handle = handle;
+                    source_user_inactive_first_index = inferred_index;
+                }
             }
             if (matches_index) {
                 identity_count++;
@@ -3728,9 +3822,11 @@ game_bridge_select_pad_handle(
      * 2. Source user + source index inactive match (standard DS4 1st).
      * 3. Source user unique inactive match (DS4 2nd alongside DualSense or preallocated).
      * 4. Source user multiple inactive disambiguated by index.
-     * 5. Global unique inactive match (single inactive slot across table).
-     * 6. Global inactive disambiguated by index.
-     * 7. Sole active entry bound to identity. */
+     * 5. Source user multiple inactive pick first available inactive slot (e.g. FC 26 P2).
+     * 6. Global unique inactive match (single inactive slot across table).
+     * 7. Global inactive disambiguated by index.
+     * 8. Global multiple inactive pick first available inactive slot (e.g. FC 26 P2 multi-user).
+     * 9. Sole active entry bound to identity. */
     if (ds4_count == 1u) {
         *out_handle = unique_ds4_handle;
         *out_index = unique_ds4_index;
@@ -3749,6 +3845,11 @@ game_bridge_select_pad_handle(
         *out_handle = source_index_inactive_handle;
         *out_index = source_index_inactive_index;
         method = "source-user-index-inactive-unique";
+    } else if (ds4_count == 0u && source_user_inactive_count > 1u &&
+               source_user_inactive_first_handle >= 0) {
+        *out_handle = source_user_inactive_first_handle;
+        *out_index = source_user_inactive_first_index;
+        method = "source-user-inactive-first";
     } else if (ds4_count == 0u && inactive_count == 1u) {
         *out_handle = unique_inactive_handle;
         *out_index = unique_inactive_index;
@@ -3758,6 +3859,11 @@ game_bridge_select_pad_handle(
         *out_handle = source_index_inactive_handle;
         *out_index = source_index_inactive_index;
         method = "global-index-inactive-unique";
+    } else if (ds4_count == 0u && inactive_count > 1u &&
+               global_inactive_first_handle >= 0) {
+        *out_handle = global_inactive_first_handle;
+        *out_index = global_inactive_first_index;
+        method = "global-inactive-first";
     } else if (ds4_count == 0u && inactive_count == 0u &&
                active_count == 1u && identity_count == 1u) {
         *out_handle = sole_handle;
@@ -4642,6 +4748,8 @@ wireless_ds4_game_bridge_status(pid_t game_pid, intptr_t args_kaddr,
     out_status->game_pad_index = (int32_t)args.reserved0;
     out_status->buttons = pad.buttons;
     out_status->connected = pad.connected;
+    out_status->reset_combo_ticks = args.reset_combo_ticks;
+    out_status->reset_requested = args.reset_requested;
     return 0;
 #endif
 }

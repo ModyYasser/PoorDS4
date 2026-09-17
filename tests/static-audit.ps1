@@ -96,6 +96,14 @@ Assert-True ($bridge.Contains(
 Assert-True ($bridge.Contains(
     'active_count == 1u && identity_count == 1u')) `
     'Sole active fallback is not bound to the source controller identity.'
+Assert-True ($bridge.Contains('source-user-inactive-first')) `
+    'Multi-slot game routing lacks the source-user-inactive-first fallback for P2.'
+Assert-True ($bridge.Contains('global-inactive-first')) `
+    'Multi-slot game routing lacks the global-inactive-first fallback for P2.'
+Assert-True ($main.Contains('SESSION_END_RESET_REQUESTED')) `
+    'Supervisor is missing the controller reset shortcut lifecycle state.'
+Assert-True ($bridge.Contains('reset_combo_ticks')) `
+    'Bridge and reader are missing the reset combo tick tracking.'
 Assert-True ($bridge.Contains('poords4_rc=%d\nreport_schema=8')) `
     'Firmware reports do not identify their RC and schema.'
 Assert-True ($bridge.Contains('client_locator_summary')) `
