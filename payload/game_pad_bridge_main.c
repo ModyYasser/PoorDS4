@@ -22,6 +22,7 @@
 
 #define POORDS4_DATA_DIR   "/data/poords4"
 #define GAME_BRIDGE_STOP_FILE  POORDS4_DATA_DIR "/stop-game-pad-bridge"
+#define GAME_BRIDGE_RESET_FILE POORDS4_DATA_DIR "/reset-game-pad-bridge"
 #define GAME_BRIDGE_LOG_FILE   POORDS4_DATA_DIR "/game-pad-bridge.log"
 #define GAME_BRIDGE_LOG_BACKUP POORDS4_DATA_DIR "/game-pad-bridge.log.1"
 #define GAME_BRIDGE_LOCK_FILE  POORDS4_DATA_DIR "/game-pad-bridge-supervisor.lock"
@@ -936,6 +937,13 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
                 end_reason = SESSION_END_RESET_REQUESTED;
                 break;
             }
+            if (access(GAME_BRIDGE_RESET_FILE, F_OK) == 0) {
+                (void)unlink(GAME_BRIDGE_RESET_FILE);
+                poords4_log(
+                    "[PoorDS4] reset requested via reset trigger file\n");
+                end_reason = SESSION_END_RESET_REQUESTED;
+                break;
+            }
         }
         if ((loop_count % 30u) == 0) {
             if (game_alive) {
@@ -1278,6 +1286,7 @@ main(void)
 
     poords4_log_reset();
     (void)unlink(GAME_BRIDGE_STOP_FILE);
+    (void)unlink(GAME_BRIDGE_RESET_FILE);
     install_shutdown_signal_handlers();
     g_last_lifecycle_ms = monotonic_milliseconds();
     g_last_lifecycle_wall_ms = wallclock_milliseconds();
@@ -1419,6 +1428,17 @@ main(void)
                 "[PoorDS4] reset requested while waiting for game\n");
             game_bridge_notify(
                 "PoorDS4: reset requested via controller shortcut");
+            reader_restart_required = 1;
+            sleep_interruptible(500000);
+            continue;
+        }
+
+        if (access(GAME_BRIDGE_RESET_FILE, F_OK) == 0) {
+            (void)unlink(GAME_BRIDGE_RESET_FILE);
+            poords4_log(
+                "[PoorDS4] reset requested via file while waiting for game\n");
+            game_bridge_notify(
+                "PoorDS4: reset requested via trigger file");
             reader_restart_required = 1;
             sleep_interruptible(500000);
             continue;
