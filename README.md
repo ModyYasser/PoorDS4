@@ -27,27 +27,27 @@ crash. Save your gamesave before testing (it broke the save file of a game durin
 
 ## Quick start
 
-1. Download `PoorDS4rc38.elf` from the latest release.
-2. Connect the DS4 to the PS5 user that should control the game.
-3. Send the ELF once to the console's payload loader. The game may already be
-   running or may be launched afterward.
-4. Wait for the `wireless DS4 active` notification, then play normally.
+1. **Bluetooth Pairing**: Put your DualShock 4 into pairing mode by holding `SHARE` + `PS Button` together until the lightbar starts double-blinking rapidly. On the PS5, go to `Settings > Accessories > Bluetooth Accessories` and select **DUALSHOCK 4**.
+2. **Controller Profile**: Connect the DS4 to whichever user profile should play (Player 1 or Player 2). If Player 1 is already using a native DualSense, connect the DS4 under Player 2's profile.
+3. **Deploy Payload**: Send `PoorDS4rc44.elf` to the console's ELF loader (port 9021). The game may already be running or launched afterward.
+4. **Play**: Wait for the `wireless DS4 active` notification, then play normally.
 
-Only run one automatic instance. PoorDS4 follows later game launches without
-reinjection. It performs safe cleanup before rest mode; reinject after waking.
-Use `PoorDS4-stop.elf` before replacing a running build.
+Only run one automatic instance. PoorDS4 follows later game launches without reinjection. It performs safe cleanup before rest mode; reinject after waking. Use `PoorDS4-stop.elf` before replacing a running build.
 
-## Controller compatibility
+## In-Game Hotkeys & Reset Combo
 
-The source reader recognizes Sony DS4 v1 (`054c:05c4`), DS4 v2
-(`054c:09cc`), and Sony's wireless adapter (`054c:0ba0`). It also accepts a
-controller when the PS5's `scePadIsDS4Connected` API positively identifies it
-as a DS4. Genuine Sony wireless DS4 revisions are supported; third-party
-clones and adapters with different identities require testing.
+- **Universal Reset Shortcut (`L1 + R1 + L2 + R2` held for ~400ms)**:
+  Holding `L1 + R1 + L2 + R2` simultaneously on **any connected controller** (DS4 or DualSense) triggers an instant in-game re-synchronization. PoorDS4 will quiesce active hooks, re-evaluate all game pad slots, re-bind the controller to the correct profile, and re-attach seamlessly without needing to reinject the payload.
+  Use this shortcut if:
+  - You switched user profiles in the middle of a game session.
+  - Player 2 joined late after the title screen.
+  - You want to force a clean re-detection of the controller table.
 
-One DS4 is translated per PoorDS4 instance. The selected DS4 may be the first,
-second, or later connected controller, provided the game's pad table contains
-one unambiguous destination slot.
+## Controller Compatibility & Multiplayer
+
+- **Supported Controllers**: Sony DualShock 4 v1 (`054c:05c4`), DS4 v2 (`054c:09cc`), and official Sony wireless USB adapters (`054c:0ba0`).
+- **Multi-Controller & Player 2**: Fully supported. DualSense controllers remain strictly on their original Sony hardware input path and are never clobbered or stolen. PoorDS4 detects open/waiting player slots and binds cleanly to Player 2 alongside a Player 1 DualSense.
+- **Native DualSense Touchpad Emulation**: Touchpad geometry is spoofed at native `1920x1080` resolution matching DualSense hardware, ensuring full compatibility with Unreal Engine 4/5 titles, Stellar Blade, and EA Sports FC 26.
 
 ## How it works
 

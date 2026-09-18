@@ -670,12 +670,12 @@ remote_pad_reader_stub(void *arg)
                 if (ticks < 65535u)
                     ticks++;
                 a->reset_combo_ticks = ticks;
-                if (ticks >= 120u)
+                if (ticks >= 45u)
                     __atomic_store_n(
                         &a->reset_requested, 1u, __ATOMIC_RELEASE);
             } else {
-                if (a->reset_combo_ticks >= 2u)
-                    a->reset_combo_ticks -= 2u;
+                if (a->reset_combo_ticks >= 1u)
+                    a->reset_combo_ticks -= 1u;
                 else
                     a->reset_combo_ticks = 0;
             }
@@ -3228,17 +3228,19 @@ game_bridge_collect_import_hooks(
             !object.dynsec ||
             object.mapbase == (uint64_t)libpad_base)
             continue;
-        /* Only the eboot owns the lifecycle we track. Patching imports in a
-         * backported/fakelib SPRX would couple PoorDS4 to ShadowMount's
-         * union overlay and can leave a library hook alive past game cleanup. */
-        if (!include_modules && object.handle != 0)
-            continue;
         char object_path[192];
         memset(object_path, 0, sizeof(object_path));
         if (object.path)
             (void)mdbg_copyout(
                 target, (intptr_t)object.path, object_path,
                 sizeof(object_path) - 1u);
+        /* Only the eboot and game-local /app0/ modules own the lifecycle we track.
+         * Patching imports in a backported/fakelib SPRX would couple PoorDS4 to ShadowMount's
+         * union overlay and can leave a library hook alive past game cleanup. */
+        int is_app_module = (object.handle == 0) ||
+            (object_path[0] != '\0' && strncmp(object_path, "/app0/", 6) == 0);
+        if (!include_modules && !is_app_module)
+            continue;
         GameBridgeDynlibSectionPrefix section;
         memset(&section, 0, sizeof(section));
         if (kernel_copyout(

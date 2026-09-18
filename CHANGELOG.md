@@ -3,19 +3,29 @@
 All notable changes to this project are documented here. Release tags follow
 Semantic Versioning; wireless-bridge candidates use `0.1.0-rcN`.
 
-## [0.1.0-rc44] - 2026-09-17
+## [0.1.0-rc44] - 2026-09-18
 
 ### Fixed
 
-- **Late-Join DualSense Slot Stealing Prevention**:
-  - In `game_bridge_select_pad_handle()`, Rule 9 ("sole-entry") now verifies that the active entry is not a native DualSense (`0x054c:0x0ce6`) or DualSense Edge (`0x054c:0x0df2`). When a secondary DS4 connects mid-game in titles like FC 26 where Player 1 is on native DualSense and Player 2's slot is not yet opened, PoorDS4 avoids stealing Slot 0 and instead waits for Player 2's slot to be created.
+- **Slot Arbitration & Player 2 / Late-Join DualSense Slot Stealing Prevention**:
+  - Defined explicit `is_dualsense`, `is_active_dualsense`, and updated `is_inactive = !is_active_dualsense && (!connected || is_ds4)` in slot selection. Disconnected and uninitialized game slots (`valid=1, connected=0`) are now recognized as available candidate destinations, while active DualSense controllers are completely protected and never stolen.
+  - In `game_bridge_select_pad_handle()`, Rule 9 ("sole-entry") verifies that the active entry is not a native DualSense (`0x054c:0x0ce6`) or DualSense Edge (`0x054c:0x0df2`). When a secondary DS4 connects mid-game in titles like FC 26 where Player 1 is on native DualSense and Player 2's slot is not yet opened, PoorDS4 avoids stealing Slot 0 and instead waits for Player 2's slot to be created.
   - Reduced polling retry delay for `waiting_for_game_pad_handle` (`install_result == -4`) from 1.0–5.0s down to 200ms with a 300-retry limit (60s total window), hooking Player 2 within 200ms of slot allocation.
-- **Universal Controller Reset Shortcut (`L1+R1+L2+R2` for ~1.25s)**:
+- **Dynamic Table Locator Decoupling (FW 7.61 & Multi-Profile Support)**:
+  - Decoupled candidate table acceptance from pre-existing source user match in `game_cache_validate_table_candidate` (`entries > 0u && entries <= 8u`). Table discovery now succeeds when Player 2 connects on a secondary profile, with unassigned user IDs (`0xffffffff`), or on fresh title launches, resolving `error=pad_client_table_discovery` (`result=-4`) on FW 7.61 (Issues #9, #12) and Mortal Kombat 1 (Issue #10).
+- **Native DualSense Touchpad Geometry Emulation (UE4/UE5 Crash Fix)**:
+  - Updated `touchResolutionY` in `game_pad_get_controller_info_stub` to 1080 (`0x0438`), matching native DualSense geometry (`1920x1080`), fixing Unreal Engine 4/5 titles (Stellar Blade, Visage) crash when resetting controller settings or querying touchpad bounds (Issue #14).
+- **Game-Local `/app0/` Module Import Scanning**:
+  - Extended import hook discovery to scan game-local `/app0/` PRX modules in addition to `eboot.bin`. Games with modular input plugins (Unreal Engine games, Wuchang: Fallen Feathers) have all `libScePad` calls intercepted and translated without input flickering or unhooked calls (Issue #11).
+- **Older Firmware (4.03 - 5.50) Protection Fallback**:
+  - Added target protection fallback allowing proven wrapper targets when `kernel_get_vmem_protection` returns `<= 0`, resolving `unsupported_firmware_abi` rejection on FW 4.03, 5.10, and 5.50 (Issues #2, #3, #5, #13).
+- **Universal Controller Reset Shortcut (`L1+R1+L2+R2` held for ~375ms)**:
   - Clamped in-game pad slot indexing to `(handle & 0xff) % 4u` to ensure valid per-slot tracking across high handle descriptors.
-  - Lowered trigger threshold to 75 ticks (~1.25s at 60Hz) with 2-tick decay debouncing across both DS4 reader stream and in-game hooks.
-  - Accelerated reader status polling from 1000ms down to 250ms in the session supervisor, catching controller reset requests within 250ms.
+  - Lowered trigger threshold to 45 ticks (~375ms at 120Hz / ~750ms at 60Hz) with 1-tick decay debouncing across both DS4 reader stream and in-game hooks.
+  - Added `wireless_ds4_game_bridge_check_reset()` directly querying target process atomic memory every 4 loops (~33ms) in the supervisor, making the reset shortcut instantaneously responsive from any controller.
   - Fixed in-place reader recovery to poll bridge status every 100ms and immediately process `reset_requested` (`return -4`), allowing the shortcut on DualSense to trigger a clean payload reset even while the wireless DS4 is disconnected.
-- **Payload Stability & Teardown Hygiene**:
+- **Bridge Status Resilience & Teardown Hygiene**:
+  - Prevented contention failure in `wireless_ds4_game_bridge_status` when 120Hz packets are actively publishing.
   - Eliminated redundant `teardown_game_bridge()` invocations on `SESSION_END_RESET_REQUESTED` and `SESSION_END_BRIDGE_HEALTH_FAILED`, preventing `remove refused non-passive layout` / `result=-1` warnings during recovery cycles.
 
 ## [0.1.0-rc43] - 2026-09-17
