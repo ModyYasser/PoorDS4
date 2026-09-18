@@ -99,11 +99,11 @@ make -C payload CC=ps5-clang.cmd clean
 make -C payload CC=ps5-clang.cmd release audit
 ```
 
-RC43 release assets use ps5-payload-sdk v0.42:
+RC44 release assets use ps5-payload-sdk v0.42:
 
 | Output | Purpose |
 | --- | --- |
-| `PoorDS4rc43.elf` | Automatic wireless DS4 bridge |
+| `PoorDS4rc44.elf` | Automatic wireless DS4 bridge |
 | `PoorDS4-status.elf` | Read-only bridge status snapshot |
 | `PoorDS4-stop.elf` | Cooperative stop request |
 
