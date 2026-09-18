@@ -738,15 +738,15 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
                 have_previous_input = 1;
                 if (is_reset_combo_held(pad.buttons, pad.analogButtons.l2, pad.analogButtons.r2)) {
                     session_reset_combo_ticks++;
-                    if (session_reset_combo_ticks >= 90u) {
+                    if (session_reset_combo_ticks >= 45u) {
                         poords4_log(
                             "[PoorDS4] reset requested via supervisor DS4 stream\n");
                         end_reason = SESSION_END_RESET_REQUESTED;
                         break;
                     }
                 } else {
-                    if (session_reset_combo_ticks >= 2u)
-                        session_reset_combo_ticks -= 2u;
+                    if (session_reset_combo_ticks >= 1u)
+                        session_reset_combo_ticks -= 1u;
                     else
                         session_reset_combo_ticks = 0;
                 }
@@ -929,6 +929,14 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
             last_health_frame = input_frames;
         }
         loop_count++;
+        if ((loop_count % 4u) == 0 && bridge_args != 0 && game_alive) {
+            if (wireless_ds4_game_bridge_check_reset(game_pid, bridge_args) == 1) {
+                poords4_log(
+                    "[PoorDS4] reset requested via fast-poll direct atomic flag\n");
+                end_reason = SESSION_END_RESET_REQUESTED;
+                break;
+            }
+        }
         if ((loop_count % 30u) == 0) {
             if (game_alive) {
                 PoorDS4GameBridgeStatus bridge_status;

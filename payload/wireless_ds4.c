@@ -1018,12 +1018,12 @@ game_bridge_check_reset_shortcut(GamePadBridgeArgs *args, int32_t handle, void *
         args->reset_ticks[slot] = ticks;
         if ((uint32_t)ticks > args->reset_combo_ticks)
             __atomic_store_n(&args->reset_combo_ticks, (uint32_t)ticks, __ATOMIC_RELAXED);
-        if (ticks >= 75u) {
+        if (ticks >= 45u) {
             __atomic_store_n(&args->reset_requested, 1u, __ATOMIC_RELEASE);
         }
     } else {
         uint8_t ticks = args->reset_ticks[slot];
-        args->reset_ticks[slot] = (ticks >= 2u) ? (ticks - 2u) : 0u;
+        args->reset_ticks[slot] = (ticks >= 1u) ? (ticks - 1u) : 0u;
     }
 }
 
@@ -1421,8 +1421,8 @@ game_pad_get_controller_info_stub(int32_t handle, void *out,
             info[3] = 0x3f;
             info[4] = 0x80;
             info[5] = 0x07;
-            info[6] = 0xaf;
-            info[7] = 0x03;
+            info[6] = 0x38;
+            info[7] = 0x04;
             info[8] = 13;
             info[9] = 13;
             info[10] = 0;
@@ -3790,7 +3790,10 @@ game_bridge_select_pad_handle(
         int32_t inferred_index = handle & 0xff;
         int is_ds4 = remote_pad_is_known_ds4(
             connected, vendor, product);
-        int is_inactive = (!connected && !valid);
+        int is_dualsense = (vendor == UINT16_C(0x054c) &&
+                            (product == UINT16_C(0x0ce6) || product == UINT16_C(0x0df2)));
+        int is_active_dualsense = (connected && is_dualsense);
+        int is_inactive = !is_active_dualsense && (!connected || is_ds4);
         int matches_user = (user_id == source_user_id);
         int matches_index = (inferred_index == source_pad_index);
         report_printf(
@@ -4182,12 +4185,15 @@ wireless_ds4_game_bridge_run_passive(
         ? game_bridge_target_protection(target, wrapper_targets[2]) : -1;
     int data_target_protection = wrapper_targets_ok[4]
         ? game_bridge_target_protection(target, wrapper_targets[4]) : -1;
-    int state_target_exec = state_target_protection >= 0 &&
-        (state_target_protection & PROT_EXEC) != 0;
-    int read_target_exec = read_target_protection >= 0 &&
-        (read_target_protection & PROT_EXEC) != 0;
-    int data_target_exec = data_target_protection >= 0 &&
-        (data_target_protection & PROT_EXEC) != 0;
+    int state_target_exec = (state_target_protection > 0 &&
+        (state_target_protection & PROT_EXEC) != 0) ||
+        (state_target_protection <= 0 && wrapper_targets_ok[0]);
+    int read_target_exec = (read_target_protection > 0 &&
+        (read_target_protection & PROT_EXEC) != 0) ||
+        (read_target_protection <= 0 && wrapper_targets_ok[2]);
+    int data_target_exec = (data_target_protection > 0 &&
+        (data_target_protection & PROT_EXEC) != 0) ||
+        (data_target_protection <= 0 && wrapper_targets_ok[4]);
     wrapper_targets_exec[0] = wrapper_targets_exec[1] =
         state_target_exec;
     wrapper_targets_exec[2] = wrapper_targets_exec[3] =
@@ -4198,8 +4204,9 @@ wireless_ds4_game_bridge_run_passive(
                sizeof(controller_info_prologue)) == 0;
     int controller_info_protection =
         game_bridge_target_protection(target, originals[5]);
-    int controller_info_exec = controller_info_protection >= 0 &&
-        (controller_info_protection & PROT_EXEC) != 0;
+    int controller_info_exec = (controller_info_protection > 0 &&
+        (controller_info_protection & PROT_EXEC) != 0) ||
+        (controller_info_protection <= 0 && originals[5] > 0);
     uint64_t game_pad_hashes[POORDS4_PAD_FINGERPRINT_COUNT];
     int source_library_match =
         g_source_pad_firmware == firmware &&
@@ -4742,8 +4749,8 @@ wireless_ds4_game_bridge_status(pid_t game_pid, intptr_t args_kaddr,
             break;
         }
     }
-    if (!stable_snapshot ||
-        args.magic != POORDS4_GAME_BRIDGE_MAGIC ||
+    (void)stable_snapshot;
+    if (args.magic != POORDS4_GAME_BRIDGE_MAGIC ||
         args.pad_size != POORDS4_GAME_BRIDGE_PAD_SIZE ||
         args.remote_block <= 0 || args.remote_block_size == 0)
         return -1;
@@ -4797,6 +4804,26 @@ wireless_ds4_game_bridge_status(pid_t game_pid, intptr_t args_kaddr,
     out_status->reset_combo_ticks = args.reset_combo_ticks;
     out_status->reset_requested = args.reset_requested;
     return 0;
+#endif
+}
+
+int
+wireless_ds4_game_bridge_check_reset(pid_t game_pid, intptr_t args_address)
+{
+#if !defined(__PROSPERO__)
+    (void)game_pid; (void)args_address;
+    return -1;
+#else
+    if (game_pid <= 0 || !args_address)
+        return -1;
+    uint32_t reset_val = 0;
+    intptr_t reset_addr = args_address +
+        (intptr_t)offsetof(GamePadBridgeArgs, reset_requested);
+    if (remote_reader_copyout(
+            game_pid, reset_addr, &reset_val, sizeof(reset_val)) == 0) {
+        return reset_val != 0 ? 1 : 0;
+    }
+    return -1;
 #endif
 }
 
@@ -5162,7 +5189,8 @@ game_cache_validate_table_candidate(
     }
     if (out_entries) *out_entries = entries;
     if (out_identity) *out_identity = identity;
-    return entries > 0u && (identity == 1u || (source_user_id >= 0 && user_matches >= 1u));
+    (void)user_matches;
+    return entries > 0u && entries <= 8u;
 #endif
 }
 
@@ -5419,10 +5447,29 @@ game_cache_find_table(
             *out_stride = match_strides[0];
         return 0;
     }
-    if (match_count > 1u)
-        report_printf(report_fd, "client_locator_error=ambiguous\n");
-    else
-        report_printf(report_fd, "client_locator_error=no_valid_table\n");
+    if (match_count > 1u) {
+        unsigned best_identity = 0;
+        int best_idx = 0;
+        for (unsigned idx = 0; idx < match_count; ++idx) {
+            unsigned entries = 0, ident = 0;
+            if (game_cache_validate_table_candidate(
+                    target, base, mapsize, matches[idx], match_strides[idx],
+                    source_user_id, source_pad_index, &entries, &ident) &&
+                ident > best_identity) {
+                best_identity = ident;
+                best_idx = (int)idx;
+            }
+        }
+        report_printf(
+            report_fd,
+            "client_locator_disambiguated match=%u best=%d identity=%u\n",
+            match_count, best_idx, best_identity);
+        *out_table = matches[best_idx];
+        if (out_stride)
+            *out_stride = match_strides[best_idx];
+        return 0;
+    }
+    report_printf(report_fd, "client_locator_error=no_valid_table\n");
     game_cache_report_user_hits(
         target, base, mapsize, source_user_id, report_fd);
     return -1;

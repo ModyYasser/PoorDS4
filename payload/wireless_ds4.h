@@ -113,6 +113,8 @@ typedef struct {
 
 int wireless_ds4_game_bridge_status(pid_t game_pid, intptr_t args_address,
                                    PoorDS4GameBridgeStatus *out_status);
+int wireless_ds4_game_bridge_check_reset(pid_t game_pid,
+                                        intptr_t args_address);
 int wireless_ds4_game_bridge_remove(pid_t game_pid,
                                    intptr_t args_address);
 /* Suspend-safe teardown: restore game imports without target syscalls,
