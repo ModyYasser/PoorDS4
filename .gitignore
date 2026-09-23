@@ -1,3 +1,5 @@
 *.elf
+*.sprx
 /build/
 /logs/
+

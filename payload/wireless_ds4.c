@@ -897,7 +897,7 @@ game_bridge_direct_available(GamePadBridgeArgs *args)
 static __attribute__((always_inline)) inline int
 game_bridge_handle_matches(GamePadBridgeArgs *args, int32_t handle)
 {
-    if (!args || handle < 0)
+    if (!args || handle <= 0 || (handle & 0xffffff00) == 0)
         return 0;
     if (handle == args->pad_handle)
         return 1;

@@ -123,9 +123,13 @@ main(void)
         ? wireless_ds4_game_bridge_status(
               bridge_pid, bridge_args, &bridge) : -1;
 
-    char report[8192];
-    int length = snprintf(
-        report, sizeof(report),
+    FILE *f = fopen(STATUS_REPORT_TMP, "w");
+    if (!f) {
+        payload_exit(1);
+        return 0;
+    }
+
+    fprintf(f,
         "mode=read-only-game-bridge-status\n"
         "supervisor_read_result=%d\n"
         "reader_identity_result=%d\nreader_pid=%d\n"
@@ -163,8 +167,7 @@ main(void)
         "bridge_published_packets=%llu\nbridge_direct_fallback_frames=%llu\n"
         "bridge_native_backing_calls=%llu\nbridge_native_backing_errors=%llu\n"
         "bridge_native_passthrough_frames=%llu\nbridge_native_connected_frames=%llu\n"
-        "bridge_event_ring_head=%u\n"
-        "--- supervisor ---\n%s",
+        "bridge_event_ring_head=%u\n",
         (int)supervisor_length, identity_result, reader_pid,
         (unsigned long)reader_args, reader_result,
         reader.ready, reader.stop, reader.last_result, reader.seq,
@@ -202,34 +205,85 @@ main(void)
         (unsigned long long)bridge.native_backing_errors,
         (unsigned long long)bridge.native_passthrough_frames,
         (unsigned long long)bridge.native_connected_frames,
-        bridge.event_ring_head,
-        supervisor);
+        bridge.event_ring_head);
 
-    int success = length > 0;
-    size_t used = success && (size_t)length < sizeof(report)
-        ? (size_t)length : sizeof(report) - 1u;
-    size_t offset = 0;
-    int fd = open(STATUS_REPORT_TMP, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0) {
-        success = 0;
-    } else {
-        while (success && offset < used) {
-            ssize_t written = write(fd, report + offset, used - offset);
-            if (written > 0) {
-                offset += (size_t)written;
-                continue;
-            }
-            if (written < 0 && errno == EINTR)
-                continue;
-            success = 0;
-        }
-        if (close(fd) != 0)
-            success = 0;
+    fprintf(f, "--- observed handles ---\n");
+    for (unsigned i = 0; i < 4u; ++i) {
+        fprintf(f, "observed_handle[%u]=0x%08x (calls=%llu)\n",
+                i, (uint32_t)bridge.observed_handles[i],
+                (unsigned long long)bridge.observed_handle_calls[i]);
     }
-    if (success && rename(STATUS_REPORT_TMP, STATUS_REPORT) != 0)
-        success = 0;
-    if (!success)
-        (void)unlink(STATUS_REPORT_TMP);
-    payload_exit(success && supervisor_length >= 0 ? 0 : 1);
+
+    fprintf(f, "--- last events (ring buffer) ---\n");
+    fprintf(f, "Seq    | Timestamp (ms) | Delta | API Stub        | Handle     | Flags | Sticks (L/R)        | Triggers | Buttons\n");
+    fprintf(f, "-------+----------------+-------+-----------------+------------+-------+---------------------+----------+-------------------------\n");
+
+    uint32_t head = bridge.event_ring_head;
+    uint32_t start_seq = (head >= POORDS4_GAME_BRIDGE_EVENT_RING_SIZE)
+        ? (head - POORDS4_GAME_BRIDGE_EVENT_RING_SIZE) : 0u;
+    uint32_t prev_time = 0;
+
+    for (uint32_t s = start_seq; s < head; ++s) {
+        uint32_t idx = s % POORDS4_GAME_BRIDGE_EVENT_RING_SIZE;
+        const PoorDS4InputEvent *evt = &bridge.event_ring[idx];
+        if (evt->seq != s && head >= POORDS4_GAME_BRIDGE_EVENT_RING_SIZE)
+            continue;
+
+        uint32_t delta = (prev_time > 0 && evt->timestamp_ms >= prev_time)
+            ? (evt->timestamp_ms - prev_time) : 0u;
+        prev_time = evt->timestamp_ms;
+
+        char flag_str[16] = {0};
+        snprintf(flag_str, sizeof(flag_str), "%s%s%s%s",
+                 (evt->flags & POORDS4_EVT_FLAG_DIRECT) ? "D" : "",
+                 (evt->flags & POORDS4_EVT_FLAG_NATIVE) ? "N" : "",
+                 (evt->flags & POORDS4_EVT_FLAG_CHANGED) ? "C" : "",
+                 (evt->flags & POORDS4_EVT_FLAG_MISMATCH) ? "M" : "");
+        if (flag_str[0] == '\0')
+            snprintf(flag_str, sizeof(flag_str), "-");
+
+        const char *stub_name = "unknown";
+        switch (evt->stub_kind) {
+        case POORDS4_EVT_KIND_READ_STATE: stub_name = "read_state"; break;
+        case POORDS4_EVT_KIND_READ_STATE_EXT: stub_name = "read_state_ext"; break;
+        case POORDS4_EVT_KIND_READ: stub_name = "read"; break;
+        case POORDS4_EVT_KIND_READ_EXT: stub_name = "read_ext"; break;
+        case POORDS4_EVT_KIND_DATA_INTERNAL: stub_name = "data_internal"; break;
+        case POORDS4_EVT_KIND_CONTROLLER_INFO: stub_name = "controller_info"; break;
+        }
+
+        char btn_str[128] = "NONE";
+        if (evt->buttons != 0) {
+            btn_str[0] = '\0';
+            struct { uint32_t mask; const char *name; } map[] = {
+                { 0x00000001u, "SELECT" }, { 0x00000002u, "L3" }, { 0x00000004u, "R3" },
+                { 0x00000008u, "START" },  { 0x00000010u, "UP" }, { 0x00000020u, "RIGHT" },
+                { 0x00000040u, "DOWN" },   { 0x00000080u, "LEFT" }, { 0x00000100u, "L2" },
+                { 0x00000200u, "R2" },     { 0x00000400u, "L1" }, { 0x00000800u, "R1" },
+                { 0x00001000u, "TRIANGLE"},{ 0x00002000u, "CIRCLE"}, { 0x00004000u, "CROSS" },
+                { 0x00008000u, "SQUARE" }, { 0x00100000u, "TOUCHPAD" }
+            };
+            size_t written = 0;
+            for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); ++i) {
+                if (evt->buttons & map[i].mask) {
+                    int n = snprintf(btn_str + written, sizeof(btn_str) - written, "%s%s",
+                                     written > 0 ? "|" : "", map[i].name);
+                    if (n > 0) written += (size_t)n;
+                    if (written >= sizeof(btn_str) - 1u) break;
+                }
+            }
+        }
+
+        fprintf(f, "%-6u | %-14u | +%-4u | %-15s | 0x%08x | %-5s | (%3u,%3u)(%3u,%3u) | L2:%-3u R2:%-3u | %s\n",
+                evt->seq, evt->timestamp_ms, delta,
+                stub_name, (uint32_t)evt->handle, flag_str,
+                evt->lx, evt->ly, evt->rx, evt->ry,
+                evt->l2, evt->r2, btn_str);
+    }
+
+    fprintf(f, "--- supervisor ---\n%s", supervisor);
+    fclose(f);
+    (void)rename(STATUS_REPORT_TMP, STATUS_REPORT);
+    payload_exit(supervisor_length >= 0 ? 0 : 1);
     return 0;
 }

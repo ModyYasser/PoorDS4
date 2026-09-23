@@ -954,6 +954,16 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
                         }
                     }
                 }
+                /* DualShock 4 potentiometer resting snap: eliminate mechanical deadband drift
+                 * within +/- 12 of 128 so menus and sensitive controls remain rock-solid. */
+                if (pad.leftStick.x >= 116 && pad.leftStick.x <= 140)
+                    pad.leftStick.x = 128;
+                if (pad.leftStick.y >= 116 && pad.leftStick.y <= 140)
+                    pad.leftStick.y = 128;
+                if (pad.rightStick.x >= 116 && pad.rightStick.x <= 140)
+                    pad.rightStick.x = 128;
+                if (pad.rightStick.y >= 116 && pad.rightStick.y <= 140)
+                    pad.rightStick.y = 128;
                 int input_changed = have_previous_input &&
                     (pad.buttons != previous_buttons ||
                      pad.leftStick.x > previous_lx + 4 ||
