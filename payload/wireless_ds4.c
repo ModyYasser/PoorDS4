@@ -39,6 +39,10 @@
 #define GC_FORCE_STRUCTURAL_FIRMWARE 0
 #endif
 
+#ifndef POORDS4_DATA_DIR
+#define POORDS4_DATA_DIR "/data/poords4"
+#endif
+
 extern void poords4_log(const char *format, ...);
 #define klog_printf poords4_log
 #define POORDS4_REMOTE_PAD_CAPACITY 256u
@@ -827,11 +831,24 @@ typedef struct {
     volatile uint8_t last_native_r2;
     volatile uint8_t last_native_connected;
     volatile uint8_t last_native_count;
+    /* Diagnostic Telemetry & Observability Suite */
+    volatile int32_t last_caller_handle;
+    volatile int32_t last_mismatched_handle;
+    volatile uint64_t handle_match_calls;
+    volatile uint64_t handle_mismatch_calls;
+    volatile uint64_t read_zero_returns;
+    volatile uint64_t read_nonzero_returns;
+    volatile uint32_t current_read_streak;
+    volatile uint32_t max_read_streak;
+    volatile int32_t observed_handles[4];
+    volatile uint64_t observed_handle_calls[4];
+    volatile uint32_t event_ring_head;
+    PoorDS4InputEvent event_ring[POORDS4_GAME_BRIDGE_EVENT_RING_SIZE];
 } GamePadBridgeArgs;
 
 _Static_assert(offsetof(GamePadBridgeArgs, legacy_fp_setsockopt) == 496,
                "PoorDS4 bridge ABI v1 prefix changed");
-_Static_assert(sizeof(GamePadBridgeArgs) == 2952,
+_Static_assert(sizeof(GamePadBridgeArgs) == 4592,
                "GamePadBridgeArgs ABI changed");
 
 static pid_t g_game_bridge_direct_pid = -1;
@@ -955,6 +972,7 @@ game_bridge_native_connected(void *out)
     return ((volatile uint8_t *)out)[offsetof(ScePadData, connected)] != 0;
 }
 
+
 static __attribute__((always_inline)) inline void
 game_bridge_record_native(GamePadBridgeArgs *args, void *out)
 {
@@ -1027,6 +1045,87 @@ game_bridge_check_reset_shortcut(GamePadBridgeArgs *args, int32_t handle, void *
     }
 }
 
+static __attribute__((always_inline)) inline void
+game_bridge_record_call(GamePadBridgeArgs *args, int32_t handle, int matched)
+{
+    if (!args)
+        return;
+    __atomic_store_n(&args->last_caller_handle, handle, __ATOMIC_RELAXED);
+    if (matched) {
+        (void)__atomic_fetch_add(&args->handle_match_calls, 1, __ATOMIC_RELAXED);
+    } else {
+        __atomic_store_n(&args->last_mismatched_handle, handle, __ATOMIC_RELAXED);
+        (void)__atomic_fetch_add(&args->handle_mismatch_calls, 1, __ATOMIC_RELAXED);
+    }
+    for (unsigned i = 0; i < 4u; ++i) {
+        int32_t obs = __atomic_load_n(&args->observed_handles[i], __ATOMIC_RELAXED);
+        if (obs == handle) {
+            (void)__atomic_fetch_add(&args->observed_handle_calls[i], 1, __ATOMIC_RELAXED);
+            return;
+        }
+        if (obs == -1 || obs == 0) {
+            int32_t expected = obs;
+            if (__atomic_compare_exchange_n(&args->observed_handles[i], &expected, handle,
+                                            0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+                (void)__atomic_fetch_add(&args->observed_handle_calls[i], 1, __ATOMIC_RELAXED);
+                return;
+            }
+            if (__atomic_load_n(&args->observed_handles[i], __ATOMIC_RELAXED) == handle) {
+                (void)__atomic_fetch_add(&args->observed_handle_calls[i], 1, __ATOMIC_RELAXED);
+                return;
+            }
+        }
+    }
+}
+
+static __attribute__((always_inline)) inline void
+game_bridge_record_event(GamePadBridgeArgs *args, uint8_t stub_kind,
+                         int32_t handle, int32_t return_val,
+                         const void *pad_data, uint8_t base_flags)
+{
+    if (!args)
+        return;
+    uint32_t head = __atomic_fetch_add(&args->event_ring_head, 1, __ATOMIC_RELAXED);
+    uint32_t slot = head % POORDS4_GAME_BRIDGE_EVENT_RING_SIZE;
+    volatile PoorDS4InputEvent *evt = &args->event_ring[slot];
+
+    evt->seq = head;
+    evt->handle = handle;
+    evt->stub_kind = stub_kind;
+
+    uint8_t flags = base_flags;
+    if (pad_data && return_val >= 0) {
+        const ScePadData *pad = (const ScePadData *)pad_data;
+        evt->timestamp_ms = (uint32_t)(pad->timestamp / 1000ull);
+        evt->buttons = pad->buttons;
+        evt->lx = pad->leftStick.x;
+        evt->ly = pad->leftStick.y;
+        evt->rx = pad->rightStick.x;
+        evt->ry = pad->rightStick.y;
+        evt->l2 = pad->analogButtons.l2;
+        evt->r2 = pad->analogButtons.r2;
+
+        int active = (pad->buttons != 0) ||
+                     (pad->analogButtons.l2 != 0) || (pad->analogButtons.r2 != 0) ||
+                     (pad->leftStick.x < 96 || pad->leftStick.x > 160) ||
+                     (pad->leftStick.y < 96 || pad->leftStick.y > 160) ||
+                     (pad->rightStick.x < 96 || pad->rightStick.x > 160) ||
+                     (pad->rightStick.y < 96 || pad->rightStick.y > 160);
+        if (active)
+            flags |= POORDS4_EVT_FLAG_CHANGED;
+    } else {
+        evt->timestamp_ms = 0;
+        evt->buttons = 0;
+        evt->lx = 128;
+        evt->ly = 128;
+        evt->rx = 128;
+        evt->ry = 128;
+        evt->l2 = 0;
+        evt->r2 = 0;
+    }
+    evt->flags = flags;
+}
+
 __attribute__((noinline, used, section(".text.ds4gamebridge")))
 int32_t
 game_pad_read_state_stub(int32_t handle, void *out,
@@ -1039,8 +1138,13 @@ game_pad_read_state_stub(int32_t handle, void *out,
     int native_called = 0;
     int32_t native_result = (int32_t)0x80920001u;
     int32_t final_result = 0;
+    int direct_copied = 0;
+    int matched = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        ? game_bridge_handle_matches(args, handle) : 0;
+    if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        game_bridge_record_call(args, handle, matched);
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
-        game_bridge_handle_matches(args, handle) && out &&
+        matched && out &&
         game_bridge_direct_available(args) &&
         args->pad_size == POORDS4_GAME_BRIDGE_PAD_SIZE) {
         if (original) {
@@ -1063,24 +1167,24 @@ game_pad_read_state_stub(int32_t handle, void *out,
         if (native_connected)
             (void)__atomic_fetch_add(
                 &args->native_connected_frames, 1, __ATOMIC_RELAXED);
-        if (native_connected) {
+        (void)__atomic_fetch_add(
+            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+        if (direct_active)
             (void)__atomic_fetch_add(
-                &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
-            (void)__atomic_fetch_add(
-                &args->read_state_calls, 1, __ATOMIC_RELAXED);
-            final_result = native_result;
+                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
+        if (game_bridge_copy_direct(
+                args, out, &args->read_state_calls)) {
+            final_result = 0;
+            direct_copied = 1;
         } else {
-            (void)__atomic_fetch_add(
-                &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
-            if (direct_active)
+            if (native_connected) {
                 (void)__atomic_fetch_add(
-                    &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
-            if (game_bridge_copy_direct(
-                    args, out, &args->read_state_calls))
-                final_result = 0;
-            else
-                final_result = native_called ? native_result :
-                    (original ? original(handle, out, 0) : native_result);
+                    &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                (void)__atomic_fetch_add(
+                    &args->read_state_calls, 1, __ATOMIC_RELAXED);
+            }
+            final_result = native_called ? native_result :
+                (original ? original(handle, out, 0) : native_result);
         }
     } else {
         final_result = native_called ? native_result :
@@ -1088,6 +1192,11 @@ game_pad_read_state_stub(int32_t handle, void *out,
     }
     if (final_result == 0 && out)
         game_bridge_check_reset_shortcut(args, handle, out);
+    if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC && final_result == 0) {
+        uint8_t flags = (direct_copied ? POORDS4_EVT_FLAG_DIRECT : POORDS4_EVT_FLAG_NATIVE);
+        if (!matched) flags |= POORDS4_EVT_FLAG_MISMATCH;
+        game_bridge_record_event(args, POORDS4_EVT_KIND_READ_STATE, handle, final_result, out, flags);
+    }
     return final_result;
 }
 
@@ -1107,8 +1216,13 @@ game_pad_read_state_ext_stub(int32_t handle, void *out,
     int native_called = 0;
     int32_t native_result = (int32_t)0x80920001u;
     int32_t final_result = 0;
+    int direct_copied = 0;
+    int matched = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        ? game_bridge_handle_matches(args, handle) : 0;
+    if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        game_bridge_record_call(args, handle, matched);
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
-        game_bridge_handle_matches(args, handle) && out &&
+        matched && out &&
         game_bridge_direct_available(args) &&
         args->pad_size == POORDS4_GAME_BRIDGE_PAD_SIZE) {
         if (original_ext) {
@@ -1136,25 +1250,25 @@ game_pad_read_state_ext_stub(int32_t handle, void *out,
         if (native_connected)
             (void)__atomic_fetch_add(
                 &args->native_connected_frames, 1, __ATOMIC_RELAXED);
-        if (native_connected) {
+        (void)__atomic_fetch_add(
+            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+        if (direct_active)
             (void)__atomic_fetch_add(
-                &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
-            (void)__atomic_fetch_add(
-                &args->read_state_ext_calls, 1, __ATOMIC_RELAXED);
-            final_result = native_result;
+                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
+        if (game_bridge_copy_direct(
+                args, out, &args->read_state_ext_calls)) {
+            final_result = 0;
+            direct_copied = 1;
         } else {
-            (void)__atomic_fetch_add(
-                &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
-            if (direct_active)
+            if (native_connected) {
                 (void)__atomic_fetch_add(
-                    &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
-            if (game_bridge_copy_direct(
-                    args, out, &args->read_state_ext_calls))
-                final_result = 0;
-            else
-                final_result = native_called ? native_result :
-                    (original_ext ? original_ext(handle, out) :
-                     (fallback_internal ? fallback_internal(handle, out, 1) : native_result));
+                    &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                (void)__atomic_fetch_add(
+                    &args->read_state_ext_calls, 1, __ATOMIC_RELAXED);
+            }
+            final_result = native_called ? native_result :
+                (original_ext ? original_ext(handle, out) :
+                 (fallback_internal ? fallback_internal(handle, out, 1) : native_result));
         }
     } else {
         final_result = native_called ? native_result :
@@ -1163,6 +1277,11 @@ game_pad_read_state_ext_stub(int32_t handle, void *out,
     }
     if (final_result == 0 && out)
         game_bridge_check_reset_shortcut(args, handle, out);
+    if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC && final_result == 0) {
+        uint8_t flags = (direct_copied ? POORDS4_EVT_FLAG_DIRECT : POORDS4_EVT_FLAG_NATIVE);
+        if (!matched) flags |= POORDS4_EVT_FLAG_MISMATCH;
+        game_bridge_record_event(args, POORDS4_EVT_KIND_READ_STATE_EXT, handle, final_result, out, flags);
+    }
     return final_result;
 }
 
@@ -1178,8 +1297,13 @@ game_pad_read_stub(int32_t handle, void *out, int32_t num,
     int native_called = 0;
     int32_t native_result = (int32_t)0x80920001u;
     int32_t final_result = 0;
+    int direct_copied = 0;
+    int matched = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        ? game_bridge_handle_matches(args, handle) : 0;
+    if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        game_bridge_record_call(args, handle, matched);
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
-        game_bridge_handle_matches(args, handle) && out && num > 0 &&
+        matched && out && num > 0 &&
         game_bridge_direct_available(args) &&
         args->pad_size == POORDS4_GAME_BRIDGE_PAD_SIZE) {
         if (original) {
@@ -1202,24 +1326,34 @@ game_pad_read_stub(int32_t handle, void *out, int32_t num,
         if (native_connected)
             (void)__atomic_fetch_add(
                 &args->native_connected_frames, 1, __ATOMIC_RELAXED);
-        if (native_connected) {
+        (void)__atomic_fetch_add(
+            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+        if (direct_active)
             (void)__atomic_fetch_add(
-                &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
-            (void)__atomic_fetch_add(
-                &args->read_calls, 1, __ATOMIC_RELAXED);
-            final_result = native_result;
+                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
+        volatile uint32_t *read_seq_table =
+            (volatile uint32_t *)(void *)args->legacy_pad_data;
+        uint32_t slot = (uint32_t)(handle & 7u);
+        uint32_t current_seq = __atomic_load_n(
+            &args->direct_seq, __ATOMIC_ACQUIRE);
+        if (current_seq == 0 || current_seq == read_seq_table[slot]) {
+            final_result = 0;
         } else {
-            (void)__atomic_fetch_add(
-                &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
-            if (direct_active)
-                (void)__atomic_fetch_add(
-                    &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
             if (game_bridge_copy_direct(
-                    args, out, &args->read_calls))
+                    args, out, &args->read_calls)) {
+                read_seq_table[slot] = current_seq;
                 final_result = 1;
-            else
+                direct_copied = 1;
+            } else {
+                if (native_connected) {
+                    (void)__atomic_fetch_add(
+                        &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                    (void)__atomic_fetch_add(
+                        &args->read_calls, 1, __ATOMIC_RELAXED);
+                }
                 final_result = native_called ? native_result :
                     (original ? original(handle, out, num, 0) : native_result);
+            }
         }
     } else {
         final_result = native_called ? native_result :
@@ -1227,6 +1361,24 @@ game_pad_read_stub(int32_t handle, void *out, int32_t num,
     }
     if (final_result > 0 && out)
         game_bridge_check_reset_shortcut(args, handle, out);
+    if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC) {
+        if (final_result == 0) {
+            (void)__atomic_fetch_add(&args->read_zero_returns, 1, __ATOMIC_RELAXED);
+            __atomic_store_n(&args->current_read_streak, 0, __ATOMIC_RELAXED);
+        } else if (final_result > 0) {
+            (void)__atomic_fetch_add(&args->read_nonzero_returns, 1, __ATOMIC_RELAXED);
+            uint32_t streak = __atomic_add_fetch(&args->current_read_streak, 1, __ATOMIC_RELAXED);
+            uint32_t cur_max = __atomic_load_n(&args->max_read_streak, __ATOMIC_RELAXED);
+            while (streak > cur_max) {
+                if (__atomic_compare_exchange_n(&args->max_read_streak, &cur_max, streak,
+                                                0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+                    break;
+            }
+            uint8_t flags = (direct_copied ? POORDS4_EVT_FLAG_DIRECT : POORDS4_EVT_FLAG_NATIVE);
+            if (!matched) flags |= POORDS4_EVT_FLAG_MISMATCH;
+            game_bridge_record_event(args, POORDS4_EVT_KIND_READ, handle, final_result, out, flags);
+        }
+    }
     return final_result;
 }
 
@@ -1246,8 +1398,13 @@ game_pad_read_ext_stub(int32_t handle, void *out, int32_t num,
     int native_called = 0;
     int32_t native_result = (int32_t)0x80920001u;
     int32_t final_result = 0;
+    int direct_copied = 0;
+    int matched = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        ? game_bridge_handle_matches(args, handle) : 0;
+    if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        game_bridge_record_call(args, handle, matched);
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
-        game_bridge_handle_matches(args, handle) && out && num > 0 &&
+        matched && out && num > 0 &&
         game_bridge_direct_available(args) &&
         args->pad_size == POORDS4_GAME_BRIDGE_PAD_SIZE) {
         if (original_ext) {
@@ -1275,25 +1432,35 @@ game_pad_read_ext_stub(int32_t handle, void *out, int32_t num,
         if (native_connected)
             (void)__atomic_fetch_add(
                 &args->native_connected_frames, 1, __ATOMIC_RELAXED);
-        if (native_connected) {
+        (void)__atomic_fetch_add(
+            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+        if (direct_active)
             (void)__atomic_fetch_add(
-                &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
-            (void)__atomic_fetch_add(
-                &args->read_ext_calls, 1, __ATOMIC_RELAXED);
-            final_result = native_result;
+                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
+        volatile uint32_t *read_ext_seq_table =
+            (volatile uint32_t *)(void *)(args->legacy_pad_data + 32);
+        uint32_t slot = (uint32_t)(handle & 7u);
+        uint32_t current_seq = __atomic_load_n(
+            &args->direct_seq, __ATOMIC_ACQUIRE);
+        if (current_seq == 0 || current_seq == read_ext_seq_table[slot]) {
+            final_result = 0;
         } else {
-            (void)__atomic_fetch_add(
-                &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
-            if (direct_active)
-                (void)__atomic_fetch_add(
-                    &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
             if (game_bridge_copy_direct(
-                    args, out, &args->read_ext_calls))
+                    args, out, &args->read_ext_calls)) {
+                read_ext_seq_table[slot] = current_seq;
                 final_result = 1;
-            else
+                direct_copied = 1;
+            } else {
+                if (native_connected) {
+                    (void)__atomic_fetch_add(
+                        &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                    (void)__atomic_fetch_add(
+                        &args->read_ext_calls, 1, __ATOMIC_RELAXED);
+                }
                 final_result = native_called ? native_result :
                     (original_ext ? original_ext(handle, out, num) :
                      (fallback_internal ? fallback_internal(handle, out, num, 1) : native_result));
+            }
         }
     } else {
         final_result = native_called ? native_result :
@@ -1302,6 +1469,24 @@ game_pad_read_ext_stub(int32_t handle, void *out, int32_t num,
     }
     if (final_result > 0 && out)
         game_bridge_check_reset_shortcut(args, handle, out);
+    if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC) {
+        if (final_result == 0) {
+            (void)__atomic_fetch_add(&args->read_zero_returns, 1, __ATOMIC_RELAXED);
+            __atomic_store_n(&args->current_read_streak, 0, __ATOMIC_RELAXED);
+        } else if (final_result > 0) {
+            (void)__atomic_fetch_add(&args->read_nonzero_returns, 1, __ATOMIC_RELAXED);
+            uint32_t streak = __atomic_add_fetch(&args->current_read_streak, 1, __ATOMIC_RELAXED);
+            uint32_t cur_max = __atomic_load_n(&args->max_read_streak, __ATOMIC_RELAXED);
+            while (streak > cur_max) {
+                if (__atomic_compare_exchange_n(&args->max_read_streak, &cur_max, streak,
+                                                0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+                    break;
+            }
+            uint8_t flags = (direct_copied ? POORDS4_EVT_FLAG_DIRECT : POORDS4_EVT_FLAG_NATIVE);
+            if (!matched) flags |= POORDS4_EVT_FLAG_MISMATCH;
+            game_bridge_record_event(args, POORDS4_EVT_KIND_READ_EXT, handle, final_result, out, flags);
+        }
+    }
     return final_result;
 }
 
@@ -1317,8 +1502,13 @@ game_pad_get_data_internal_stub(int32_t handle, void *out,
     int native_called = 0;
     int32_t native_result = (int32_t)0x80920001u;
     int32_t final_result = 0;
+    int direct_copied = 0;
+    int matched = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        ? game_bridge_handle_matches(args, handle) : 0;
+    if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        game_bridge_record_call(args, handle, matched);
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
-        game_bridge_handle_matches(args, handle) && out &&
+        matched && out &&
         game_bridge_direct_available(args) &&
         args->pad_size == POORDS4_GAME_BRIDGE_PAD_SIZE) {
         if (original) {
@@ -1341,24 +1531,24 @@ game_pad_get_data_internal_stub(int32_t handle, void *out,
         if (native_connected)
             (void)__atomic_fetch_add(
                 &args->native_connected_frames, 1, __ATOMIC_RELAXED);
-        if (native_connected) {
+        (void)__atomic_fetch_add(
+            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+        if (direct_active)
             (void)__atomic_fetch_add(
-                &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
-            (void)__atomic_fetch_add(
-                &args->data_internal_calls, 1, __ATOMIC_RELAXED);
-            final_result = native_result;
+                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
+        if (game_bridge_copy_direct(
+                args, out, &args->data_internal_calls)) {
+            final_result = 0;
+            direct_copied = 1;
         } else {
-            (void)__atomic_fetch_add(
-                &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
-            if (direct_active)
+            if (native_connected) {
                 (void)__atomic_fetch_add(
-                    &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
-            if (game_bridge_copy_direct(
-                    args, out, &args->data_internal_calls))
-                final_result = 0;
-            else
-                final_result = native_called ? native_result :
-                    (original ? original(handle, out, 1) : native_result);
+                    &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                (void)__atomic_fetch_add(
+                    &args->data_internal_calls, 1, __ATOMIC_RELAXED);
+            }
+            final_result = native_called ? native_result :
+                (original ? original(handle, out, 1) : native_result);
         }
     } else {
         final_result = native_called ? native_result :
@@ -1366,6 +1556,11 @@ game_pad_get_data_internal_stub(int32_t handle, void *out,
     }
     if (final_result == 0 && out)
         game_bridge_check_reset_shortcut(args, handle, out);
+    if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC && final_result == 0) {
+        uint8_t flags = (direct_copied ? POORDS4_EVT_FLAG_DIRECT : POORDS4_EVT_FLAG_NATIVE);
+        if (!matched) flags |= POORDS4_EVT_FLAG_MISMATCH;
+        game_bridge_record_event(args, POORDS4_EVT_KIND_DATA_INTERNAL, handle, final_result, out, flags);
+    }
     return final_result;
 }
 
@@ -1397,12 +1592,16 @@ game_pad_get_controller_info_stub(int32_t handle, void *out,
         args ? args->fp_get_controller_info_trampoline : 0);
     int32_t result = original
         ? original(handle, out) : (int32_t)0x80920001u;
+    int matched = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        ? game_bridge_handle_matches(args, handle) : 0;
+    if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        game_bridge_record_call(args, handle, matched);
     if (args)
         (void)__atomic_fetch_add(
             &args->controller_info_calls, 1, __ATOMIC_RELAXED);
     if (args &&
         args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
-        game_bridge_handle_matches(args, handle) && out &&
+        matched && out &&
         game_bridge_direct_available(args)) {
         volatile uint8_t *info = (volatile uint8_t *)out;
         uint16_t touch_x = (uint16_t)info[4] |
@@ -1411,10 +1610,10 @@ game_pad_get_controller_info_stub(int32_t handle, void *out,
             ((uint16_t)info[7] << 8u);
         /* Preserve a successful firmware-native metadata prefix. This matters
          * on 8.60, whose live controller reports 1920x1080 rather than the
-         * later build's geometry. Fill only when Sony returned no plausible
-         * geometry for the disconnected backing slot. */
+         * later build's geometry. Normalize DS4 942-line touch to 1080 to match
+         * scaled coordinates and prevent Unreal Engine assertion panics. */
         if (result != 0 || touch_x == 0 || touch_x > 8192u ||
-            touch_y == 0 || touch_y > 8192u) {
+            touch_y == 0 || touch_y > 8192u || touch_y == 942u) {
             info[0] = 0x00;
             info[1] = 0x00;
             info[2] = 0x80;
@@ -1444,7 +1643,11 @@ game_pad_get_controller_info_stub(int32_t handle, void *out,
             (void)__atomic_fetch_add(
                 &args->controller_info_result_overrides, 1,
                 __ATOMIC_RELAXED);
-        return 0;
+        result = 0;
+    }
+    if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC) {
+        uint8_t flags = (matched ? 0 : POORDS4_EVT_FLAG_MISMATCH);
+        game_bridge_record_event(args, POORDS4_EVT_KIND_CONTROLLER_INFO, handle, result, NULL, flags);
     }
     return result;
 }
@@ -3153,15 +3356,123 @@ game_bridge_report_libpad_layout(pid_t target, intptr_t base, int report_fd)
  * kernel_dynlib helpers. Every followed size, index, pointer, and slot is
  * validated before a caller-owned import is changed. */
 static int
-game_bridge_symbol_kind(const char name[12], const char nids[6][12])
+game_bridge_symbol_kind(const char *name, const char nids[6][12], const char *const names[6])
 {
-    if (!name || !nids)
+    if (!name)
         return -1;
-    for (unsigned kind = 0; kind < 6; ++kind) {
-        if (memcmp(name, nids[kind], 11) == 0)
-            return (int)kind;
+    if (nids) {
+        for (unsigned kind = 0; kind < 6; ++kind) {
+            if (memcmp(name, nids[kind], 11) == 0)
+                return (int)kind;
+        }
+    }
+    if (names) {
+        for (unsigned kind = 0; kind < 6; ++kind) {
+            if (strncmp(name, names[kind], strlen(names[kind])) == 0)
+                return (int)kind;
+        }
     }
     return -1;
+}
+
+static void
+game_bridge_dump_modules_report(
+    pid_t target, intptr_t libpad_base,
+    const GameBridgeImportHook *hooks, uint32_t hook_count)
+{
+#if defined(__PROSPERO__)
+    if (target <= 0)
+        return;
+    (void)mkdir(POORDS4_DATA_DIR, 0755);
+    (void)mkdir(POORDS4_DATA_DIR "/reports", 0755);
+    uint32_t fw = kernel_get_fw_version();
+    char mod_archive[160];
+    snprintf(mod_archive, sizeof(mod_archive),
+             POORDS4_DATA_DIR "/reports/modules-fw-%08x-pid-%d.txt",
+             fw, target);
+    FILE *f1 = fopen(mod_archive, "w");
+    FILE *f2 = fopen(POORDS4_DATA_DIR "/modules-last.txt", "w");
+    if (!f1 && !f2)
+        return;
+
+#define MOD_PRINT(...) do { \
+    if (f1) fprintf(f1, __VA_ARGS__); \
+    if (f2) fprintf(f2, __VA_ARGS__); \
+} while (0)
+
+    MOD_PRINT("================================================================================\n");
+    MOD_PRINT("PoorDS4 Game Bridge Loaded Modules Report\n");
+    MOD_PRINT("================================================================================\n");
+    MOD_PRINT("PID:         %d\n", target);
+    MOD_PRINT("Firmware:    0x%08x\n", fw);
+    MOD_PRINT("libScePad:   0x%lx\n", (unsigned long)libpad_base);
+    MOD_PRINT("--------------------------------------------------------------------------------\n");
+    MOD_PRINT("%-4s %-8s %-18s %-12s %-8s %s\n", "Idx", "Handle", "MapBase", "MapSize", "Scope", "Path");
+    MOD_PRINT("--------------------------------------------------------------------------------\n");
+
+    uint64_t proc = (uint64_t)kernel_get_proc(target);
+    uint64_t shared_object = 0;
+    uint64_t object_address = 0;
+    if (proc && kernel_copyout(proc + 0x3e8, &shared_object, sizeof(shared_object)) == 0 &&
+        shared_object && kernel_copyout(shared_object, &object_address, sizeof(object_address)) == 0) {
+        unsigned object_count = 0;
+        while (object_address != 0 && object_count++ < 512u) {
+            GameBridgeDynlibObjectPrefix object;
+            memset(&object, 0, sizeof(object));
+            if (kernel_copyout((intptr_t)object_address, &object, sizeof(object)) != 0)
+                break;
+            object_address = object.next;
+            char object_path[192];
+            memset(object_path, 0, sizeof(object_path));
+            if (object.path)
+                (void)mdbg_copyout(target, (intptr_t)object.path, object_path, sizeof(object_path) - 1u);
+            int is_fakelib = (object_path[0] != '\0' && strstr(object_path, "fakelib") != NULL);
+            int is_system_module = (object_path[0] != '\0' && (
+                strncmp(object_path, "/system/", 8) == 0 ||
+                strncmp(object_path, "/system_ex/", 11) == 0 ||
+                strncmp(object_path, "/common/", 8) == 0));
+            int is_app_module = (object.handle == 0) ||
+                (!is_fakelib && !is_system_module && object_path[0] != '\0' && (
+                    strncmp(object_path, "/app0/", 6) == 0 ||
+                    strncmp(object_path, "/app0_patch/", 12) == 0 ||
+                    strstr(object_path, "app0/") != NULL ||
+                    strstr(object_path, "shadowmnt/") != NULL));
+            const char *scope = is_app_module ? "APP" : (is_fakelib ? "FAKELIB" : (is_system_module ? "SYSTEM" : "OTHER"));
+            MOD_PRINT("%-4u 0x%-6llx 0x%-16llx 0x%-10llx %-8s %s\n",
+                      object_count - 1u, (unsigned long long)object.handle,
+                      (unsigned long long)object.mapbase,
+                      (unsigned long long)object.mapsize,
+                      scope, object_path);
+        }
+    }
+
+    if (hooks && hook_count > 0) {
+        static const char *const names[6] = {
+            "scePadReadState", "scePadReadStateExt", "scePadRead",
+            "scePadReadExt", "scePadGetDataInternal",
+            "scePadGetControllerInformation"};
+        MOD_PRINT("\n--------------------------------------------------------------------------------\n");
+        MOD_PRINT("Hooked Imports (%u hooks found):\n", hook_count);
+        MOD_PRINT("--------------------------------------------------------------------------------\n");
+        MOD_PRINT("%-4s %-28s %-18s %-18s %-6s\n", "Idx", "API", "Slot", "Original", "Prot");
+        MOD_PRINT("--------------------------------------------------------------------------------\n");
+        for (uint32_t hi = 0; hi < hook_count; ++hi) {
+            const char *api_name = hooks[hi].kind < 6 ? names[hooks[hi].kind] : "unknown";
+            MOD_PRINT("%-4u %-28s 0x%-16lx 0x%-16lx 0x%-4x\n",
+                      hi, api_name,
+                      (unsigned long)hooks[hi].slot,
+                      (unsigned long)hooks[hi].original,
+                      hooks[hi].protection);
+        }
+    }
+    MOD_PRINT("================================================================================\n");
+
+#undef MOD_PRINT
+    if (f1) fclose(f1);
+    if (f2) fclose(f2);
+#else
+    (void)target; (void)libpad_base; (void)hooks; (void)hook_count;
+#endif
 }
 
 static int
@@ -3237,8 +3548,17 @@ game_bridge_collect_import_hooks(
         /* Only the eboot and game-local /app0/ modules own the lifecycle we track.
          * Patching imports in a backported/fakelib SPRX would couple PoorDS4 to ShadowMount's
          * union overlay and can leave a library hook alive past game cleanup. */
+        int is_fakelib = (object_path[0] != '\0' && strstr(object_path, "fakelib") != NULL);
+        int is_system_module = (object_path[0] != '\0' && (
+            strncmp(object_path, "/system/", 8) == 0 ||
+            strncmp(object_path, "/system_ex/", 11) == 0 ||
+            strncmp(object_path, "/common/", 8) == 0));
         int is_app_module = (object.handle == 0) ||
-            (object_path[0] != '\0' && strncmp(object_path, "/app0/", 6) == 0);
+            (!is_fakelib && !is_system_module && object_path[0] != '\0' && (
+                strncmp(object_path, "/app0/", 6) == 0 ||
+                strncmp(object_path, "/app0_patch/", 12) == 0 ||
+                strstr(object_path, "app0/") != NULL ||
+                strstr(object_path, "shadowmnt/") != NULL));
         if (!include_modules && !is_app_module)
             continue;
         GameBridgeDynlibSectionPrefix section;
@@ -3325,7 +3645,23 @@ game_bridge_collect_import_hooks(
                     target, name_address, symbol_name,
                     sizeof(symbol_name) - 1u);
             int kind = name_read == 0
-                ? game_bridge_symbol_kind(symbol_name, nids) : -1;
+                ? game_bridge_symbol_kind(symbol_name, nids, names) : -1;
+            if (name_read == 0 && kind < 0 &&
+                rela.r_offset <= object.mapsize - sizeof(uint64_t)) {
+                intptr_t check_slot = (intptr_t)(
+                    object.mapbase + rela.r_offset);
+                uint64_t check_val = 0;
+                if (check_slot > 0 && mdbg_copyout(
+                        target, check_slot, &check_val, sizeof(check_val)) == 0) {
+                    for (unsigned candidate_kind = 0;
+                         candidate_kind < 6u; ++candidate_kind) {
+                        if (check_val == (uint64_t)originals[candidate_kind]) {
+                            kind = (int)candidate_kind;
+                            break;
+                        }
+                    }
+                }
+            }
             if (name_read != 0) {
                 if (rela.r_offset >
                         object.mapsize - sizeof(uint64_t))
@@ -3455,9 +3791,11 @@ game_bridge_collect_import_hooks(
         "import_scan_objects=%u relocations=%u hooks=%u\n",
         object_count, relocation_count, *out_count);
     if (*out_count == 0) {
+        game_bridge_dump_modules_report(target, libpad_base, NULL, 0);
         report_printf(report_fd, "import_scan_error=no_supported_hooks\n");
         return -1;
     }
+    game_bridge_dump_modules_report(target, libpad_base, hooks, *out_count);
     return 0;
 #endif
 }
@@ -3493,7 +3831,7 @@ game_bridge_recover_stale_v1(
          * other scan failure. */
         *out_hook_count = 0;
         report_printf(report_fd, "stale_recovery_error=import_scan\n");
-        return -1;
+        return -2;
     }
     uint32_t hook_count = *out_hook_count;
 
@@ -3656,6 +3994,116 @@ game_bridge_recover_stale_v1(
         "result=%d mapping_retained_until_game_exit=1\n",
         target, (unsigned long)args_address, hook_count, recovery);
     return recovery == 0 ? 1 : -1;
+#endif
+}
+
+static void
+game_bridge_dump_client_table_report(
+    pid_t target, intptr_t table, uint32_t table_stride,
+    int32_t source_user_id, int32_t source_pad_index,
+    const char *method, int32_t selected_handle, int32_t selected_index,
+    unsigned active_count, unsigned ds4_count, unsigned inactive_count,
+    unsigned identity_count)
+{
+#if defined(__PROSPERO__)
+    if (target <= 0 || table <= 0)
+        return;
+    (void)mkdir(POORDS4_DATA_DIR, 0755);
+    (void)mkdir(POORDS4_DATA_DIR "/reports", 0755);
+    uint32_t fw = kernel_get_fw_version();
+    char tbl_archive[160];
+    snprintf(tbl_archive, sizeof(tbl_archive),
+             POORDS4_DATA_DIR "/reports/client-table-fw-%08x-pid-%d.txt",
+             fw, target);
+    FILE *f1 = fopen(tbl_archive, "w");
+    FILE *f2 = fopen(POORDS4_DATA_DIR "/client-table-last.txt", "w");
+    if (!f1 && !f2)
+        return;
+
+#define TBL_PRINT(...) do { \
+    if (f1) fprintf(f1, __VA_ARGS__); \
+    if (f2) fprintf(f2, __VA_ARGS__); \
+} while (0)
+
+    TBL_PRINT("================================================================================\n");
+    TBL_PRINT("PoorDS4 Game Bridge Internal Pad Client Table Report\n");
+    TBL_PRINT("================================================================================\n");
+    TBL_PRINT("PID:              %d\n", target);
+    TBL_PRINT("Firmware:         0x%08x\n", fw);
+    TBL_PRINT("Source User ID:   0x%08x\n", (uint32_t)source_user_id);
+    TBL_PRINT("Source Pad Index: %d\n", source_pad_index);
+    TBL_PRINT("Table Address:    0x%lx\n", (unsigned long)table);
+    TBL_PRINT("Table Stride:     0x%x\n", table_stride);
+    TBL_PRINT("--------------------------------------------------------------------------------\n");
+    TBL_PRINT("%-4s %-10s %-10s %-5s %-5s %-5s %-11s %-12s %s\n",
+              "Slot", "Handle", "UserID", "Idx", "Conn", "Val", "VID:PID", "Type", "Notes");
+    TBL_PRINT("--------------------------------------------------------------------------------\n");
+
+    for (unsigned slot = 0; slot < 24u; ++slot) {
+        intptr_t entry = table + (intptr_t)slot * table_stride;
+        int32_t connected = 0;
+        int32_t handle = 0;
+        int32_t user_id = -1;
+        int32_t valid = 0;
+        uint16_t vendor = 0;
+        uint16_t product = 0;
+        if (game_bridge_process_read(target, entry + POORDS4_PAD_CLIENT_CONNECTED_1160, &connected, sizeof(connected)) != 0 ||
+            game_bridge_process_read(target, entry + POORDS4_PAD_CLIENT_HANDLE_1160, &handle, sizeof(handle)) != 0 ||
+            game_bridge_process_read(target, entry + POORDS4_PAD_CLIENT_USER_ID_1160, &user_id, sizeof(user_id)) != 0 ||
+            game_bridge_process_read(target, entry + 0x38, &valid, sizeof(valid)) != 0 ||
+            game_bridge_process_read(target, entry + POORDS4_PAD_CLIENT_VENDOR_1160, &vendor, sizeof(vendor)) != 0 ||
+            game_bridge_process_read(target, entry + POORDS4_PAD_CLIENT_PRODUCT_1160, &product, sizeof(product)) != 0) {
+            TBL_PRINT("%-4u [READ_ERROR]\n", slot);
+            continue;
+        }
+        if (handle <= 0) {
+            TBL_PRINT("%-4u %-10s %-10s %-5s %-5s %-5s %-11s %-12s %s\n",
+                      slot, "-", "-", "-", "-", "-", "-", "EMPTY", "");
+            continue;
+        }
+        int32_t inferred_index = handle & 0xff;
+        int is_ds4 = remote_pad_is_known_ds4(connected, vendor, product);
+        int is_dualsense = (vendor == UINT16_C(0x054c) &&
+                            (product == UINT16_C(0x0ce6) || product == UINT16_C(0x0df2)));
+        const char *ctrl_type = is_ds4 ? "DS4" : (is_dualsense ? "DualSense" : (connected ? "Other" : "Inactive"));
+        int matches_user = (user_id == source_user_id);
+        int matches_index = (inferred_index == source_pad_index);
+        char notes[64];
+        notes[0] = '\0';
+        if (handle == selected_handle) {
+            snprintf(notes, sizeof(notes), "--> SELECTED <--");
+        } else if (matches_user && matches_index) {
+            snprintf(notes, sizeof(notes), "MATCH_USER+IDX");
+        } else if (matches_user) {
+            snprintf(notes, sizeof(notes), "MATCH_USER");
+        } else if (matches_index) {
+            snprintf(notes, sizeof(notes), "MATCH_IDX");
+        }
+
+        TBL_PRINT("%-4u 0x%-8x 0x%-8x %-5d %-5d %-5d 0x%04x:0x%04x %-12s %s\n",
+                  slot, (uint32_t)handle, (uint32_t)user_id, inferred_index,
+                  connected, valid, vendor, product, ctrl_type, notes);
+    }
+
+    TBL_PRINT("--------------------------------------------------------------------------------\n");
+    TBL_PRINT("Selection Decision:\n");
+    TBL_PRINT("  Method:          %s\n", method ? method : "none");
+    TBL_PRINT("  Selected Handle: 0x%08x\n", (uint32_t)selected_handle);
+    TBL_PRINT("  Selected Index:  %d\n", selected_index);
+    TBL_PRINT("  Active Slots:    %u\n", active_count);
+    TBL_PRINT("  DS4 Slots:       %u\n", ds4_count);
+    TBL_PRINT("  Inactive Slots:  %u\n", inactive_count);
+    TBL_PRINT("  Identity Count:  %u\n", identity_count);
+    TBL_PRINT("================================================================================\n");
+
+#undef TBL_PRINT
+    if (f1) fclose(f1);
+    if (f2) fclose(f2);
+#else
+    (void)target; (void)table; (void)table_stride; (void)source_user_id;
+    (void)source_pad_index; (void)method; (void)selected_handle;
+    (void)selected_index; (void)active_count; (void)ds4_count;
+    (void)inactive_count; (void)identity_count;
 #endif
 }
 
@@ -3932,6 +4380,10 @@ game_bridge_select_pad_handle(
         "active=%u ds4=%u inactive=%u identity=%u\n",
         method, (uint32_t)*out_handle, *out_index,
         active_count, ds4_count, inactive_count, identity_count);
+    game_bridge_dump_client_table_report(
+        target, table, table_stride, source_user_id, source_pad_index,
+        method, *out_handle, *out_index, active_count, ds4_count,
+        inactive_count, identity_count);
     return *out_handle >= 0 ? 0 : -1;
 }
 
@@ -4315,8 +4767,9 @@ wireless_ds4_game_bridge_run_passive(
     if (stale_result != 0) {
         /* A successful recovery asks the supervisor to retry once after the
          * original slots are visible. An unowned unexpected import fails
-         * closed and must not be overwritten. */
-        result = stale_result > 0 ? -5 : -6;
+         * closed and must not be overwritten. A transient scan failure (e.g.
+         * modules still loading) returns -4 to retry during launch grace. */
+        result = stale_result > 0 ? -5 : (stale_result == -2 ? -4 : -6);
         goto done;
     }
 
@@ -4420,6 +4873,12 @@ wireless_ds4_game_bridge_run_passive(
     args.pad_handle = game_pad_handle;
     args.reserved0 = (uint32_t)game_pad_index;
     args.reserved1 = POORDS4_GAME_BRIDGE_LAYOUT_V1;
+    args.last_caller_handle = -1;
+    args.last_mismatched_handle = -1;
+    for (unsigned i = 0; i < 4u; ++i) {
+        args.observed_handles[i] = -1;
+        args.observed_handle_calls[i] = 0;
+    }
     args.fp_state_internal = originals[0];
     args.fp_read_internal = originals[2];
     args.fp_data_internal = originals[4];
@@ -4805,6 +5264,20 @@ wireless_ds4_game_bridge_status(pid_t game_pid, intptr_t args_kaddr,
     out_status->connected = pad.connected;
     out_status->reset_combo_ticks = args.reset_combo_ticks;
     out_status->reset_requested = args.reset_requested;
+    out_status->last_caller_handle = args.last_caller_handle;
+    out_status->last_mismatched_handle = args.last_mismatched_handle;
+    out_status->handle_match_calls = args.handle_match_calls;
+    out_status->handle_mismatch_calls = args.handle_mismatch_calls;
+    out_status->read_zero_returns = args.read_zero_returns;
+    out_status->read_nonzero_returns = args.read_nonzero_returns;
+    out_status->max_read_streak = args.max_read_streak;
+    for (unsigned i = 0; i < 4u; ++i) {
+        out_status->observed_handles[i] = args.observed_handles[i];
+        out_status->observed_handle_calls[i] = args.observed_handle_calls[i];
+    }
+    out_status->event_ring_head = args.event_ring_head;
+    memcpy(out_status->event_ring, (const void *)args.event_ring,
+           sizeof(out_status->event_ring));
     return 0;
 #endif
 }
@@ -5051,9 +5524,13 @@ remote_pad_is_known_ds4(int32_t connected, uint16_t vendor,
 {
     if (!connected || vendor != UINT16_C(0x054c))
         return 0;
+    /* Explicitly exclude DualSense / DualSense Edge product IDs */
+    if (product == UINT16_C(0x0ce6) || product == UINT16_C(0x0df2))
+        return 0;
     return product == UINT16_C(0x05c4) ||
            product == UINT16_C(0x09cc) ||
-           product == UINT16_C(0x0ba0);
+           product == UINT16_C(0x0ba0) ||
+           product == 0;
 }
 
 static int

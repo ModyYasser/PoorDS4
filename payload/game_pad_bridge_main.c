@@ -15,10 +15,19 @@
 #include <unistd.h>
 
 #include <ps5/klog.h>
+#include <ps5/kernel.h>
 #include <ps5/payload.h>
 
 #include "pad_types.h"
 #include "wireless_ds4.h"
+
+typedef struct app_info {
+    uint32_t app_id;
+    uint64_t unknown1;
+    char     title_id[14];
+    char     unknown2[0x3c];
+} app_info_t;
+extern int sceKernelGetAppInfo(pid_t pid, app_info_t *info);
 
 #define POORDS4_DATA_DIR   "/data/poords4"
 #define GAME_BRIDGE_STOP_FILE  POORDS4_DATA_DIR "/stop-game-pad-bridge"
@@ -47,6 +56,7 @@ static int g_supervisor_lock_fd = -1;
 static PoorDS4PadSource g_pad_source = {-1, -1, -1, 0};
 static pid_t g_reader_pid = -1;
 static intptr_t g_reader_args;
+static intptr_t g_bridge_args;
 static size_t g_log_bytes;
 static volatile sig_atomic_t g_shutdown_requested;
 static volatile sig_atomic_t g_suspend_requested;
@@ -131,7 +141,7 @@ install_shutdown_signal_handlers(void)
 {
     (void)signal(SIGTERM, shutdown_signal_handler);
     (void)signal(SIGINT, shutdown_signal_handler);
-    (void)signal(SIGHUP, shutdown_signal_handler);
+    (void)signal(SIGHUP, SIG_IGN);
 }
 
 static void
@@ -416,6 +426,7 @@ write_supervisor_state(const char *state, pid_t game_pid,
         "auto_watch=%d\nstate=%s\n"
         "game_pid=%d\nsessions=%u\noutput_frames=%llu\n"
         "reader_pid=%d\nreader_args=0x%lx\n"
+        "bridge_args=0x%lx\n"
         "source_user=0x%08x\nsource_index=%d\n"
         "source_handle=0x%08x\nsource_is_ds4=0x%08x\n"
         "source_disconnect_grace_ms=%llu\n"
@@ -437,6 +448,7 @@ write_supervisor_state(const char *state, pid_t game_pid,
         POORDS4_AUTO_WATCH,
         state ? state : "unknown", game_pid, sessions, output_frames,
         g_reader_pid, (unsigned long)g_reader_args,
+        (unsigned long)g_bridge_args,
         (uint32_t)g_pad_source.user_id, g_pad_source.pad_index,
         (uint32_t)g_pad_source.pad_handle,
         (uint32_t)g_pad_source.ds4_connected,
@@ -635,8 +647,242 @@ make_neutral_connected_pad(ScePadData *pad)
     pad->rightStick.y = 128;
     pad->quat.w = 1.0f;
     pad->connected = 1;
+    pad->touchData.fingers = 0;
+    pad->touchData.touch[0].finger = 0x80;
+    pad->touchData.touch[1].finger = 0x80;
     pad->timestamp = timestamp;
     pad->count = count;
+}
+
+static void
+format_buttons_str(uint32_t buttons, char *out, size_t cap)
+{
+    if (!out || cap == 0)
+        return;
+    out[0] = '\0';
+    if (buttons == 0) {
+        snprintf(out, cap, "NONE");
+        return;
+    }
+    struct { uint32_t mask; const char *name; } map[] = {
+        { 0x00000001u, "SELECT" },
+        { 0x00000002u, "L3" },
+        { 0x00000004u, "R3" },
+        { 0x00000008u, "START" },
+        { 0x00000010u, "UP" },
+        { 0x00000020u, "RIGHT" },
+        { 0x00000040u, "DOWN" },
+        { 0x00000080u, "LEFT" },
+        { 0x00000100u, "L2" },
+        { 0x00000200u, "R2" },
+        { 0x00000400u, "L1" },
+        { 0x00000800u, "R1" },
+        { 0x00001000u, "TRIANGLE" },
+        { 0x00002000u, "CIRCLE" },
+        { 0x00004000u, "CROSS" },
+        { 0x00008000u, "SQUARE" },
+        { 0x00100000u, "TOUCHPAD" },
+    };
+    size_t written = 0;
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); ++i) {
+        if (buttons & map[i].mask) {
+            int n = snprintf(out + written, cap - written, "%s%s",
+                             written > 0 ? "|" : "", map[i].name);
+            if (n > 0)
+                written += (size_t)n;
+            if (written >= cap - 1u)
+                break;
+        }
+    }
+}
+
+static const char *
+event_stub_name(uint8_t stub_kind)
+{
+    switch (stub_kind) {
+    case POORDS4_EVT_KIND_READ_STATE: return "read_state";
+    case POORDS4_EVT_KIND_READ_STATE_EXT: return "read_state_ext";
+    case POORDS4_EVT_KIND_READ: return "read";
+    case POORDS4_EVT_KIND_READ_EXT: return "read_ext";
+    case POORDS4_EVT_KIND_DATA_INTERNAL: return "data_internal";
+    case POORDS4_EVT_KIND_CONTROLLER_INFO: return "controller_info";
+    default: return "unknown";
+    }
+}
+
+static void
+write_game_session_summary(
+    pid_t game_pid, const PoorDS4GameBridgeStatus *status,
+    const PoorDS4PadSource *source,
+    unsigned input_frames, unsigned output_frames,
+    unsigned stale_frames, unsigned activity_frames,
+    GameSessionEndReason end_reason,
+    uint64_t session_start_ms, uint64_t session_end_ms)
+{
+    if (!status || game_pid <= 0)
+        return;
+
+    mkdir(POORDS4_DATA_DIR, 0755);
+    mkdir(POORDS4_DATA_DIR "/reports", 0755);
+
+    char title_id[32] = "UNKNOWN";
+    app_info_t appinfo;
+    memset(&appinfo, 0, sizeof(appinfo));
+    if (sceKernelGetAppInfo(game_pid, &appinfo) == 0 && appinfo.title_id[0] != '\0') {
+        snprintf(title_id, sizeof(title_id), "%s", appinfo.title_id);
+    }
+
+    uint32_t fw = 0;
+#if defined(__PROSPERO__)
+    fw = kernel_get_fw_version();
+#endif
+
+    char archive_path[160];
+    snprintf(archive_path, sizeof(archive_path),
+             POORDS4_DATA_DIR "/reports/session-summary-fw-%08x-pid-%d.txt",
+             fw, game_pid);
+    const char *paths[2] = {
+        POORDS4_DATA_DIR "/game-pad-bridge-summary.txt",
+        archive_path
+    };
+
+    uint64_t duration_s = (session_end_ms > session_start_ms)
+        ? (session_end_ms - session_start_ms) / 1000ull : 0ull;
+
+    for (int p = 0; p < 2; ++p) {
+        FILE *f = fopen(paths[p], "w");
+        if (!f)
+            continue;
+
+        fprintf(f, "================================================================================\n");
+        fprintf(f, "PoorDS4 Game Bridge Diagnostic & Post-Mortem Session Summary\n");
+        fprintf(f, "================================================================================\n");
+        fprintf(f, "Session Details:\n");
+        fprintf(f, "  Firmware:          0x%08x\n", fw);
+        fprintf(f, "  Game PID:          %d\n", game_pid);
+        fprintf(f, "  Title ID:          %s\n", title_id);
+        fprintf(f, "  End Reason:        %s (%d)\n", game_session_end_reason_name(end_reason), end_reason);
+        fprintf(f, "  Duration:          %llu seconds\n", (unsigned long long)duration_s);
+        fprintf(f, "  Total Frames In:   %u\n", input_frames);
+        fprintf(f, "  Total Frames Out:  %u\n", output_frames);
+        fprintf(f, "  Stale Frames:      %u\n", stale_frames);
+        fprintf(f, "  Activity Frames:   %u\n", activity_frames);
+        if (source) {
+            fprintf(f, "  Source User:       0x%08x\n", (uint32_t)source->user_id);
+            fprintf(f, "  Source Pad Index:  %d\n", source->pad_index);
+            fprintf(f, "  Source Handle:     0x%08x\n", (uint32_t)source->pad_handle);
+            fprintf(f, "  Source Is DS4:     %d\n", source->ds4_connected);
+        }
+        fprintf(f, "\n");
+
+        fprintf(f, "--------------------------------------------------------------------------------\n");
+        fprintf(f, "Controller Handle & Dispatch Telemetry:\n");
+        fprintf(f, "--------------------------------------------------------------------------------\n");
+        fprintf(f, "  Configured Bridge Handle: 0x%08x (Slot: %d)\n", (uint32_t)status->pad_handle, status->game_pad_index);
+        fprintf(f, "  Last Caller Handle:       0x%08x\n", (uint32_t)status->last_caller_handle);
+        fprintf(f, "  Last Mismatched Handle:   0x%08x\n", (uint32_t)status->last_mismatched_handle);
+        fprintf(f, "  Handle Match Calls:       %llu\n", (unsigned long long)status->handle_match_calls);
+        fprintf(f, "  Handle Mismatch Calls:    %llu\n", (unsigned long long)status->handle_mismatch_calls);
+        fprintf(f, "  Observed Caller Handles:\n");
+        for (unsigned i = 0; i < 4u; ++i) {
+            if (status->observed_handles[i] != -1 && status->observed_handles[i] != 0) {
+                fprintf(f, "    [%u] Handle 0x%08x: %llu calls%s\n",
+                        i, (uint32_t)status->observed_handles[i],
+                        (unsigned long long)status->observed_handle_calls[i],
+                        (status->observed_handles[i] == status->pad_handle) ? " [BRIDGE TARGET]" : " [MISMATCH]");
+            }
+        }
+        fprintf(f, "\n");
+
+        fprintf(f, "--------------------------------------------------------------------------------\n");
+        fprintf(f, "API Import Hook Distribution:\n");
+        fprintf(f, "--------------------------------------------------------------------------------\n");
+        fprintf(f, "  scePadReadState:          %llu calls\n", (unsigned long long)status->read_state_calls);
+        fprintf(f, "  scePadReadStateExt:       %llu calls\n", (unsigned long long)status->read_state_ext_calls);
+        fprintf(f, "  scePadRead:               %llu calls\n", (unsigned long long)status->read_calls);
+        fprintf(f, "  scePadReadExt:            %llu calls\n", (unsigned long long)status->read_ext_calls);
+        fprintf(f, "  scePadGetDataInternal:    %llu calls\n", (unsigned long long)status->data_internal_calls);
+        fprintf(f, "  scePadGetControllerInfo:  %llu calls (spoofs: %llu, overrides: %llu)\n",
+                (unsigned long long)status->controller_info_calls,
+                (unsigned long long)status->controller_info_spoofs,
+                (unsigned long long)status->controller_info_result_overrides);
+        fprintf(f, "  Installed Import Hooks:   %u\n", status->import_hook_count);
+        fprintf(f, "\n");
+
+        fprintf(f, "--------------------------------------------------------------------------------\n");
+        fprintf(f, "Loop Pacing & Drain Diagnostics (Kena / Visage / Slate Detection):\n");
+        fprintf(f, "--------------------------------------------------------------------------------\n");
+        fprintf(f, "  Read Non-Zero Returns:    %llu (Packets Delivered)\n", (unsigned long long)status->read_nonzero_returns);
+        fprintf(f, "  Read Zero Returns:        %llu (Drained / No Packet)\n", (unsigned long long)status->read_zero_returns);
+        fprintf(f, "  Max Unpaced Read Streak:  %u (Reads in one frame without pause)\n", status->max_read_streak);
+        if (status->read_nonzero_returns + status->read_zero_returns > 0) {
+            double drain_ratio = (double)status->read_zero_returns /
+                (double)(status->read_nonzero_returns + status->read_zero_returns) * 100.0;
+            fprintf(f, "  Drain Ratio:              %.2f%% empty reads\n", drain_ratio);
+        }
+        fprintf(f, "\n");
+
+        fprintf(f, "--------------------------------------------------------------------------------\n");
+        fprintf(f, "Frame Delivery & Backing Hardware Fallback:\n");
+        fprintf(f, "--------------------------------------------------------------------------------\n");
+        fprintf(f, "  Direct Packets Published: %llu\n", (unsigned long long)status->published_packets);
+        fprintf(f, "  Direct Leases Expired:    %llu\n", (unsigned long long)status->lease_expirations);
+        fprintf(f, "  Direct Fallback Frames:   %llu (active: %llu)\n",
+                (unsigned long long)status->direct_fallback_frames,
+                (unsigned long long)status->direct_active_fallbacks);
+        fprintf(f, "  Snapshot Contentions:     %llu\n", (unsigned long long)status->snapshot_contention_fallbacks);
+        fprintf(f, "  Native Backing Calls:     %llu (errors: %llu)\n",
+                (unsigned long long)status->native_backing_calls,
+                (unsigned long long)status->native_backing_errors);
+        fprintf(f, "  Native Passthrough:       %llu frames\n", (unsigned long long)status->native_passthrough_frames);
+        fprintf(f, "  Native Connected Frames:  %llu\n", (unsigned long long)status->native_connected_frames);
+        fprintf(f, "  Native Input Activity:    %llu frames\n", (unsigned long long)status->native_input_activity_frames);
+        fprintf(f, "  Last Native Result:       0x%08x\n", (uint32_t)status->last_native_result);
+        fprintf(f, "\n");
+
+        fprintf(f, "--------------------------------------------------------------------------------\n");
+        fprintf(f, "Input Event Ring Buffer (Last 64 Events Chronological):\n");
+        fprintf(f, "--------------------------------------------------------------------------------\n");
+        fprintf(f, "Seq    | Timestamp (ms) | Delta | API Stub        | Handle     | Flags | Sticks (L/R)        | Triggers | Buttons\n");
+        fprintf(f, "-------+----------------+-------+-----------------+------------+-------+---------------------+----------+-------------------------\n");
+
+        uint32_t head = status->event_ring_head;
+        uint32_t start_seq = (head >= POORDS4_GAME_BRIDGE_EVENT_RING_SIZE)
+            ? (head - POORDS4_GAME_BRIDGE_EVENT_RING_SIZE) : 0u;
+        uint32_t prev_time = 0;
+
+        for (uint32_t s = start_seq; s < head; ++s) {
+            uint32_t idx = s % POORDS4_GAME_BRIDGE_EVENT_RING_SIZE;
+            const PoorDS4InputEvent *evt = &status->event_ring[idx];
+            if (evt->seq != s && head >= POORDS4_GAME_BRIDGE_EVENT_RING_SIZE)
+                continue;
+
+            uint32_t delta = (prev_time > 0 && evt->timestamp_ms >= prev_time)
+                ? (evt->timestamp_ms - prev_time) : 0u;
+            prev_time = evt->timestamp_ms;
+
+            char flag_str[16] = {0};
+            snprintf(flag_str, sizeof(flag_str), "%s%s%s%s",
+                     (evt->flags & POORDS4_EVT_FLAG_DIRECT) ? "D" : "",
+                     (evt->flags & POORDS4_EVT_FLAG_NATIVE) ? "N" : "",
+                     (evt->flags & POORDS4_EVT_FLAG_CHANGED) ? "C" : "",
+                     (evt->flags & POORDS4_EVT_FLAG_MISMATCH) ? "M" : "");
+            if (flag_str[0] == '\0')
+                snprintf(flag_str, sizeof(flag_str), "-");
+
+            char btn_str[128];
+            format_buttons_str(evt->buttons, btn_str, sizeof(btn_str));
+
+            fprintf(f, "%-6u | %-14u | +%-4u | %-15s | 0x%08x | %-5s | (%3u,%3u)(%3u,%3u) | L2:%-3u R2:%-3u | %s\n",
+                    evt->seq, evt->timestamp_ms, delta,
+                    event_stub_name(evt->stub_kind),
+                    (uint32_t)evt->handle, flag_str,
+                    evt->lx, evt->ly, evt->rx, evt->ry,
+                    evt->l2, evt->r2, btn_str);
+        }
+        fprintf(f, "================================================================================\n");
+        fclose(f);
+    }
 }
 
 static unsigned
@@ -679,6 +925,8 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
     int game_alive = 1;
     uint32_t session_reset_combo_ticks = 0;
     GameSessionEndReason end_reason = SESSION_END_STOP_REQUESTED;
+    uint64_t session_start_ms = monotonic_milliseconds();
+    g_bridge_args = bridge_args;
     write_supervisor_state(
         "active", game_pid, session, previous_output_frames, 1);
     while (!lifecycle_should_stop()) {
@@ -690,6 +938,22 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
             consecutive_read_failures = 0;
             if (seq != last_seq) {
                 input_frames++;
+                if (pad.touchData.fingers == 0) {
+                    pad.touchData.touch[0].finger |= 0x80;
+                    pad.touchData.touch[1].finger |= 0x80;
+                } else {
+                    for (unsigned int f = 0; f < 2; ++f) {
+                        if ((pad.touchData.touch[f].finger & 0x80) == 0) {
+                            uint32_t y = pad.touchData.touch[f].y;
+                            if (y < 942u) {
+                                y = (y * 1080u + 471u) / 942u;
+                                if (y > 1079u)
+                                    y = 1079u;
+                                pad.touchData.touch[f].y = (uint16_t)y;
+                            }
+                        }
+                    }
+                }
                 int input_changed = have_previous_input &&
                     (pad.buttons != previous_buttons ||
                      pad.leftStick.x > previous_lx + 4 ||
@@ -1006,6 +1270,14 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
     }
     if (g_shutdown_requested && end_reason == SESSION_END_STOP_REQUESTED)
         end_reason = SESSION_END_LIFECYCLE;
+    if (process_alive(game_pid)) {
+        PoorDS4GameBridgeStatus final_status;
+        memset(&final_status, 0, sizeof(final_status));
+        if (wireless_ds4_game_bridge_status(game_pid, bridge_args, &final_status) == 0 &&
+            final_status.bridge_ready == 1) {
+            last_bridge_status = final_status;
+        }
+    }
     int keep_bridge_for_reader_recovery =
         end_reason == SESSION_END_READER_FAILED &&
         !g_shutdown_requested && !g_skip_remote_cleanup &&
@@ -1013,13 +1285,7 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
     int remove_result = 0;
     if (keep_bridge_for_reader_recovery) {
         ScePadData neutral;
-        memset(&neutral, 0, sizeof(neutral));
-        neutral.leftStick.x = 128;
-        neutral.leftStick.y = 128;
-        neutral.rightStick.x = 128;
-        neutral.rightStick.y = 128;
-        neutral.quat.w = 1.0f;
-        neutral.connected = 1;
+        make_neutral_connected_pad(&neutral);
         (void)wireless_ds4_game_bridge_update(
             game_pid, bridge_args, &neutral, sizeof(neutral));
         poords4_log(
@@ -1043,6 +1309,11 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
         "reason_name=%s in=%u out=%u\n",
         game_pid, end_reason, game_session_end_reason_name(end_reason),
         input_frames, output_frames);
+    write_game_session_summary(
+        game_pid, &last_bridge_status, &g_pad_source,
+        input_frames, output_frames, stale_frames, activity_frames,
+        end_reason, session_start_ms, monotonic_milliseconds());
+    g_bridge_args = 0;
     if (out_end_reason)
         *out_end_reason = end_reason;
     return output_frames;

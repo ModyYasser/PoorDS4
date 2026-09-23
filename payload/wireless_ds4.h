@@ -67,6 +67,35 @@ int wireless_ds4_game_bridge_update(pid_t game_pid, intptr_t args_address,
                                    uint32_t pad_data_len);
 int wireless_ds4_game_bridge_abandon(void);
 
+#define POORDS4_GAME_BRIDGE_EVENT_RING_SIZE 64u
+
+#define POORDS4_EVT_KIND_READ_STATE      0u
+#define POORDS4_EVT_KIND_READ_STATE_EXT  1u
+#define POORDS4_EVT_KIND_READ            2u
+#define POORDS4_EVT_KIND_READ_EXT        3u
+#define POORDS4_EVT_KIND_DATA_INTERNAL   4u
+#define POORDS4_EVT_KIND_CONTROLLER_INFO 5u
+
+#define POORDS4_EVT_FLAG_DIRECT   0x01u
+#define POORDS4_EVT_FLAG_NATIVE   0x02u
+#define POORDS4_EVT_FLAG_CHANGED  0x04u
+#define POORDS4_EVT_FLAG_MISMATCH 0x08u
+
+typedef struct {
+    uint32_t seq;
+    uint32_t timestamp_ms;
+    int32_t handle;
+    uint32_t buttons;
+    uint8_t lx;
+    uint8_t ly;
+    uint8_t rx;
+    uint8_t ry;
+    uint8_t l2;
+    uint8_t r2;
+    uint8_t stub_kind;
+    uint8_t flags;
+} PoorDS4InputEvent;
+
 typedef struct {
     uint32_t layout_marker;
     uint32_t active;
@@ -109,6 +138,17 @@ typedef struct {
     uint8_t connected;
     uint32_t reset_combo_ticks;
     uint32_t reset_requested;
+    int32_t last_caller_handle;
+    int32_t last_mismatched_handle;
+    uint64_t handle_match_calls;
+    uint64_t handle_mismatch_calls;
+    uint64_t read_zero_returns;
+    uint64_t read_nonzero_returns;
+    uint32_t max_read_streak;
+    int32_t observed_handles[4];
+    uint64_t observed_handle_calls[4];
+    uint32_t event_ring_head;
+    PoorDS4InputEvent event_ring[POORDS4_GAME_BRIDGE_EVENT_RING_SIZE];
 } PoorDS4GameBridgeStatus;
 
 int wireless_ds4_game_bridge_status(pid_t game_pid, intptr_t args_address,

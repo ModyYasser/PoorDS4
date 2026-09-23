@@ -1,8 +1,9 @@
 PS5_HOST ?=
 PORT     ?= 9021
-RC_VERSION := 44
+RC_VERSION := 45
 
 TARGET        := PoorDS4rc$(RC_VERSION).elf
+EXP_TARGET    := PoorDS4exp.elf
 STATUS_TARGET := PoorDS4-status.elf
 STOP_TARGET   := PoorDS4-stop.elf
 
@@ -11,6 +12,9 @@ $(error PS5_PAYLOAD_SDK is not set)
 endif
 
 include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
+
+CC := ps5-clang.cmd
+STRIP := llvm-strip
 
 CFLAGS  += -D__PROSPERO__ -Wall -Wextra -Wshadow -Wunreachable-code \
 	-Werror -g -O2 -fPIC \
@@ -22,12 +26,15 @@ BRIDGE_LIBS  := $(RUNTIME_LIBS) -lSceUserService
 
 .PHONY: all audit clean deploy release status stop
 
-all: $(TARGET)
+all: $(TARGET) $(EXP_TARGET)
 
 $(TARGET): game_pad_bridge_main.c wireless_ds4.c wireless_ds4.h pad_types.h
 	$(CC) $(CFLAGS) -DPOORDS4_AUTO_WATCH=1 \
 		-DPOORDS4_RC_VERSION=$(RC_VERSION) -o $@ \
 		game_pad_bridge_main.c wireless_ds4.c $(LDFLAGS) $(BRIDGE_LIBS)
+
+$(EXP_TARGET): $(TARGET)
+	cp -f $(TARGET) $(EXP_TARGET)
 
 status: $(STATUS_TARGET)
 
