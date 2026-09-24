@@ -75,6 +75,7 @@ int wireless_ds4_game_bridge_abandon(void);
 #define POORDS4_EVT_KIND_READ_EXT        3u
 #define POORDS4_EVT_KIND_DATA_INTERNAL   4u
 #define POORDS4_EVT_KIND_CONTROLLER_INFO 5u
+#define POORDS4_EVT_KIND_EXT_CONTROLLER_INFO 6u
 
 #define POORDS4_EVT_FLAG_DIRECT   0x01u
 #define POORDS4_EVT_FLAG_NATIVE   0x02u

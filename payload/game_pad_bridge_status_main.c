@@ -250,6 +250,7 @@ main(void)
         case POORDS4_EVT_KIND_READ_EXT: stub_name = "read_ext"; break;
         case POORDS4_EVT_KIND_DATA_INTERNAL: stub_name = "data_internal"; break;
         case POORDS4_EVT_KIND_CONTROLLER_INFO: stub_name = "controller_info"; break;
+        case POORDS4_EVT_KIND_EXT_CONTROLLER_INFO: stub_name = "ext_info"; break;
         }
 
         char btn_str[128] = "NONE";

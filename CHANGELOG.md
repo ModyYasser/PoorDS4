@@ -3,6 +3,35 @@
 All notable changes to this project are documented here. Release tags follow
 Semantic Versioning; wireless-bridge candidates use `0.1.0-rcN`.
 
+## [0.1.0-rc47] - 2026-09-24
+
+### Fixed
+
+- **Control Ultimate Edition & Modular PRX Import Scanning**:
+  - Resolved `install_result=-4` (`import_scan_error=no_supported_hooks`) on titles with modular PRX architectures (such as Remedy's *Control Ultimate Edition*, which places pad logic in `/app0/input_ps5_f.prx` and `/app0/platform_ps5_f.prx`).
+  - Switched `dynlib_obj_t.path` dereferencing from target-space `mdbg_copyout` to kernel-space `kernel_copyout`, allowing all 72 loaded process modules to be enumerated accurately.
+  - Hardened system module identification against randomized container mount prefixes (e.g. `/AjdVD1cmDY/common/lib/libkernel.sprx`) using `strstr` substrings.
+- **Stellar Blade Button Remapping Crash Fix & Extended Controller Information**:
+  - Corrected `deviceClass` byte (offset `0x0a` / index 10) in `game_pad_get_controller_info_stub` to `1` (`SCE_PAD_DEVICE_CLASS_STANDARD` / DualSense). Previously set to `0` (`SCE_PAD_DEVICE_CLASS_UNKNOWN`), causing Unreal Engine button remapping menus to fail controller profile lookup and dereference NULL pointers.
+  - Implemented hook and spoofing stub for `scePadGetExtControllerInformation` (7th hooked API), returning DualSense geometry along with extended trigger and haptic feature descriptors (`features = 0x00000001`), preventing Sony unhooked fallback error `0x80920101` (`SCE_PAD_ERROR_DEVICE_NOT_FOUND`).
+  - Expanded gateway dispatcher table from 6 to 7 entries and re-allocated legacy unused `fp_socket` field in `GamePadBridgeArgs` to `fp_get_ext_controller_info_trampoline`, preserving the exact 4592-byte ABI struct size and backward compatibility.
+
+## [0.1.0-rc46] - 2026-09-23
+
+### Fixed
+
+- **Kena: Bridge of Spirits Ghost Handle Rejection**:
+  - Restored handle validation in `game_bridge_handle_matches` (`handle > 0 && (handle & 0xffffff00) != 0`), rejecting uninitialized/ghost handles (`0x00000000` or raw slot indices `0x00000000..0x00000017`).
+  - Restores full menu, settings, and in-game upgrade interaction in *Kena: Bridge of Spirits* without breaking multi-slot late join.
+
+## [0.1.0-rc45] - 2026-09-20
+
+### Fixed
+
+- **Poppy Playtime Chapter 3 Native Passthrough Priority**:
+  - Inverted stub evaluation order across all read stubs: always invoke the Sony firmware native function first, and only activate PoorDS4's Direct DS4 packet translation as an authoritative fallback when the backing handle is disconnected or in error.
+  - Resolves input unresponsiveness in Unreal Engine games that validate native handle state before consuming input.
+
 ## [0.1.0-rc44] - 2026-09-18
 
 ### Fixed

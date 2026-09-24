@@ -744,7 +744,7 @@ typedef struct {
     intptr_t fp_read_internal;
     intptr_t fp_data_internal;
     intptr_t fp_get_controller_info_trampoline;
-    intptr_t fp_socket;
+    intptr_t fp_get_ext_controller_info_trampoline;
     intptr_t fp_bind;
     intptr_t fp_recvfrom;
     intptr_t fp_close;
@@ -869,6 +869,8 @@ extern int32_t game_pad_read_ext_stub(
 extern int32_t game_pad_get_data_internal_stub(
     int32_t handle, void *out, GamePadBridgeArgs *args);
 extern int32_t game_pad_get_controller_info_stub(
+    int32_t handle, void *out, GamePadBridgeArgs *args);
+extern int32_t game_pad_get_ext_controller_info_stub(
     int32_t handle, void *out, GamePadBridgeArgs *args);
 extern void game_pad_bridge_stub_end(void);
 
@@ -1624,16 +1626,17 @@ game_pad_get_controller_info_stub(int32_t handle, void *out,
             info[7] = 0x04;
             info[8] = 13;
             info[9] = 13;
-            info[10] = 0;
+            info[10] = 1; /* Standard controller class (DualSense) */
             for (unsigned byte = 20; byte < 28; ++byte)
                 info[byte] = 0;
         }
+        info[10] = 1; /* Standard controller class (DualSense) */
         info[11] = 1;
         info[12] = 1;
         info[13] = 0;
         info[14] = 0;
         info[15] = 0;
-        info[16] = 0; /* standard controller class */
+        info[16] = 0;
         info[17] = 0;
         info[18] = 0;
         info[19] = 0;
@@ -1648,6 +1651,78 @@ game_pad_get_controller_info_stub(int32_t handle, void *out,
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC) {
         uint8_t flags = (matched ? 0 : POORDS4_EVT_FLAG_MISMATCH);
         game_bridge_record_event(args, POORDS4_EVT_KIND_CONTROLLER_INFO, handle, result, NULL, flags);
+    }
+    return result;
+}
+
+__attribute__((noinline, used, section(".text.ds4gamebridge")))
+int32_t
+game_pad_get_ext_controller_info_stub(int32_t handle, void *out,
+                                      GamePadBridgeArgs *args)
+{
+    typedef int32_t (*get_ext_info_fn)(int32_t, void *);
+    get_ext_info_fn original = (get_ext_info_fn)(uintptr_t)(
+        args ? args->fp_get_ext_controller_info_trampoline : 0);
+    int32_t result = original
+        ? original(handle, out) : (int32_t)0x80920001u;
+    int matched = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        ? game_bridge_handle_matches(args, handle) : 0;
+    if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        game_bridge_record_call(args, handle, matched);
+    if (args)
+        (void)__atomic_fetch_add(
+            &args->controller_info_calls, 1, __ATOMIC_RELAXED);
+    if (args &&
+        args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
+        matched && out &&
+        game_bridge_direct_available(args)) {
+        volatile uint8_t *info = (volatile uint8_t *)out;
+        uint16_t touch_x = (uint16_t)info[4] |
+            ((uint16_t)info[5] << 8u);
+        uint16_t touch_y = (uint16_t)info[6] |
+            ((uint16_t)info[7] << 8u);
+        if (result != 0 || touch_x == 0 || touch_x > 8192u ||
+            touch_y == 0 || touch_y > 8192u || touch_y == 942u) {
+            info[0] = 0x00;
+            info[1] = 0x00;
+            info[2] = 0x80;
+            info[3] = 0x3f;
+            info[4] = 0x80;
+            info[5] = 0x07;
+            info[6] = 0x38;
+            info[7] = 0x04;
+            info[8] = 13;
+            info[9] = 13;
+            info[10] = 1;
+            for (unsigned byte = 20; byte < 28; ++byte)
+                info[byte] = 0;
+        }
+        info[10] = 1; /* Standard controller class (DualSense) */
+        info[11] = 1;
+        info[12] = 1;
+        info[13] = 0;
+        info[14] = 0;
+        info[15] = 0;
+        info[16] = 0;
+        info[17] = 0;
+        info[18] = 0;
+        info[19] = 0;
+        if (result != 0) {
+            info[28] = 0x01;
+            for (unsigned byte = 29; byte < 48; ++byte)
+                info[byte] = 0;
+        }
+        (void)__atomic_fetch_add(
+            &args->controller_info_spoofs, 1, __ATOMIC_RELAXED);
+        if (result != 0)
+            (void)__atomic_fetch_add(
+                &args->controller_info_result_overrides, 1,
+                __ATOMIC_RELAXED);
+        result = 0;
+    }
+    if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC) {
+        uint8_t flags = (matched ? 0 : POORDS4_EVT_FLAG_MISMATCH);
+        game_bridge_record_event(args, POORDS4_EVT_KIND_EXT_CONTROLLER_INFO, handle, result, NULL, flags);
     }
     return result;
 }
@@ -3251,7 +3326,7 @@ _Static_assert(offsetof(GameBridgeDynlibSectionPrefix, plt_rela) == 0x48,
                "rtld PLT relocation offset changed");
 
 static int game_bridge_collect_import_hooks(
-    pid_t target, intptr_t libpad_base, const intptr_t originals[6],
+    pid_t target, intptr_t libpad_base, const intptr_t originals[7],
     GameBridgeImportHook *hooks, uint32_t *out_count, int report_fd,
     int allow_nonoriginal, int include_modules);
 static int game_cache_find_libpad_object(
@@ -3356,18 +3431,18 @@ game_bridge_report_libpad_layout(pid_t target, intptr_t base, int report_fd)
  * kernel_dynlib helpers. Every followed size, index, pointer, and slot is
  * validated before a caller-owned import is changed. */
 static int
-game_bridge_symbol_kind(const char *name, const char nids[6][12], const char *const names[6])
+game_bridge_symbol_kind(const char *name, const char nids[7][12], const char *const names[7])
 {
     if (!name)
         return -1;
     if (nids) {
-        for (unsigned kind = 0; kind < 6; ++kind) {
+        for (unsigned kind = 0; kind < 7; ++kind) {
             if (memcmp(name, nids[kind], 11) == 0)
                 return (int)kind;
         }
     }
     if (names) {
-        for (unsigned kind = 0; kind < 6; ++kind) {
+        for (unsigned kind = 0; kind < 7; ++kind) {
             if (strncmp(name, names[kind], strlen(names[kind])) == 0)
                 return (int)kind;
         }
@@ -3425,12 +3500,12 @@ game_bridge_dump_modules_report(
             char object_path[192];
             memset(object_path, 0, sizeof(object_path));
             if (object.path)
-                (void)mdbg_copyout(target, (intptr_t)object.path, object_path, sizeof(object_path) - 1u);
+                (void)kernel_copyout((intptr_t)object.path, object_path, sizeof(object_path) - 1u);
             int is_fakelib = (object_path[0] != '\0' && strstr(object_path, "fakelib") != NULL);
             int is_system_module = (object_path[0] != '\0' && (
-                strncmp(object_path, "/system/", 8) == 0 ||
-                strncmp(object_path, "/system_ex/", 11) == 0 ||
-                strncmp(object_path, "/common/", 8) == 0));
+                strstr(object_path, "/system/") != NULL ||
+                strstr(object_path, "/system_ex/") != NULL ||
+                strstr(object_path, "/common/") != NULL));
             int is_app_module = (object.handle == 0) ||
                 (!is_fakelib && !is_system_module && object_path[0] != '\0' && (
                     strncmp(object_path, "/app0/", 6) == 0 ||
@@ -3447,17 +3522,18 @@ game_bridge_dump_modules_report(
     }
 
     if (hooks && hook_count > 0) {
-        static const char *const names[6] = {
+        static const char *const names[7] = {
             "scePadReadState", "scePadReadStateExt", "scePadRead",
             "scePadReadExt", "scePadGetDataInternal",
-            "scePadGetControllerInformation"};
+            "scePadGetControllerInformation",
+            "scePadGetExtControllerInformation"};
         MOD_PRINT("\n--------------------------------------------------------------------------------\n");
         MOD_PRINT("Hooked Imports (%u hooks found):\n", hook_count);
         MOD_PRINT("--------------------------------------------------------------------------------\n");
         MOD_PRINT("%-4s %-28s %-18s %-18s %-6s\n", "Idx", "API", "Slot", "Original", "Prot");
         MOD_PRINT("--------------------------------------------------------------------------------\n");
         for (uint32_t hi = 0; hi < hook_count; ++hi) {
-            const char *api_name = hooks[hi].kind < 6 ? names[hooks[hi].kind] : "unknown";
+            const char *api_name = hooks[hi].kind < 7 ? names[hooks[hi].kind] : "unknown";
             MOD_PRINT("%-4u %-28s 0x%-16lx 0x%-16lx 0x%-4x\n",
                       hi, api_name,
                       (unsigned long)hooks[hi].slot,
@@ -3477,7 +3553,7 @@ game_bridge_dump_modules_report(
 
 static int
 game_bridge_collect_import_hooks(
-    pid_t target, intptr_t libpad_base, const intptr_t originals[6],
+    pid_t target, intptr_t libpad_base, const intptr_t originals[7],
     GameBridgeImportHook *hooks, uint32_t *out_count, int report_fd,
     int allow_nonoriginal, int include_modules)
 {
@@ -3491,12 +3567,13 @@ game_bridge_collect_import_hooks(
         !out_count)
         return -1;
     *out_count = 0;
-    char nids[6][12];
-    static const char *const names[6] = {
+    char nids[7][12];
+    static const char *const names[7] = {
         "scePadReadState", "scePadReadStateExt", "scePadRead",
         "scePadReadExt", "scePadGetDataInternal",
-        "scePadGetControllerInformation"};
-    for (unsigned kind = 0; kind < 6; ++kind) {
+        "scePadGetControllerInformation",
+        "scePadGetExtControllerInformation"};
+    for (unsigned kind = 0; kind < 7; ++kind) {
         memset(nids[kind], 0, sizeof(nids[kind]));
         nid_encode(names[kind], nids[kind]);
     }
@@ -3542,17 +3619,17 @@ game_bridge_collect_import_hooks(
         char object_path[192];
         memset(object_path, 0, sizeof(object_path));
         if (object.path)
-            (void)mdbg_copyout(
-                target, (intptr_t)object.path, object_path,
+            (void)kernel_copyout(
+                (intptr_t)object.path, object_path,
                 sizeof(object_path) - 1u);
         /* Only the eboot and game-local /app0/ modules own the lifecycle we track.
          * Patching imports in a backported/fakelib SPRX would couple PoorDS4 to ShadowMount's
          * union overlay and can leave a library hook alive past game cleanup. */
         int is_fakelib = (object_path[0] != '\0' && strstr(object_path, "fakelib") != NULL);
         int is_system_module = (object_path[0] != '\0' && (
-            strncmp(object_path, "/system/", 8) == 0 ||
-            strncmp(object_path, "/system_ex/", 11) == 0 ||
-            strncmp(object_path, "/common/", 8) == 0));
+            strstr(object_path, "/system/") != NULL ||
+            strstr(object_path, "/system_ex/") != NULL ||
+            strstr(object_path, "/common/") != NULL));
         int is_app_module = (object.handle == 0) ||
             (!is_fakelib && !is_system_module && object_path[0] != '\0' && (
                 strncmp(object_path, "/app0/", 6) == 0 ||
@@ -3654,7 +3731,7 @@ game_bridge_collect_import_hooks(
                 if (check_slot > 0 && mdbg_copyout(
                         target, check_slot, &check_val, sizeof(check_val)) == 0) {
                     for (unsigned candidate_kind = 0;
-                         candidate_kind < 6u; ++candidate_kind) {
+                         candidate_kind < 7u; ++candidate_kind) {
                         if (check_val == (uint64_t)originals[candidate_kind]) {
                             kind = (int)candidate_kind;
                             break;
@@ -3682,7 +3759,7 @@ game_bridge_collect_import_hooks(
                     return -1;
                 }
                 for (unsigned candidate_kind = 0;
-                     candidate_kind < 6u; ++candidate_kind) {
+                     candidate_kind < 7u; ++candidate_kind) {
                     if (fallback_current ==
                             (uint64_t)originals[candidate_kind]) {
                         kind = (int)candidate_kind;
@@ -3809,7 +3886,7 @@ game_bridge_collect_import_hooks(
  * unexpected import cannot be proven to belong to PoorDS4. */
 static int
 game_bridge_recover_stale_v1(
-    pid_t target, intptr_t libpad_base, const intptr_t originals[6],
+    pid_t target, intptr_t libpad_base, const intptr_t originals[7],
     GameBridgeImportHook hooks[POORDS4_GAME_BRIDGE_MAX_IMPORT_HOOKS],
     uint32_t *out_hook_count, int report_fd)
 {
@@ -3918,7 +3995,7 @@ game_bridge_recover_stale_v1(
         intptr_t slot = args.import_hook_slots[index];
         intptr_t original = args.import_hook_originals[index];
         intptr_t gateway_address = args.import_hook_gateways[index];
-        if (kind >= 6u || slot <= 0 || original != originals[kind] ||
+        if (kind >= 7u || slot <= 0 || original != originals[kind] ||
             gateway_address < args.remote_block ||
             gateway_address + 16 > args.remote_block +
                 (intptr_t)POORDS4_TARGET_PAGE_SIZE) {
@@ -4455,14 +4532,16 @@ wireless_ds4_game_bridge_run_passive(
         goto done;
     }
     intptr_t base = kernel_dynlib_mapbase_addr(target, libpad_handle);
-    intptr_t originals[6] = {
+    intptr_t originals[7] = {
         resolve_sym(target, libpad_handle, "scePadReadState"),
         resolve_sym(target, libpad_handle, "scePadReadStateExt"),
         resolve_sym(target, libpad_handle, "scePadRead"),
         resolve_sym(target, libpad_handle, "scePadReadExt"),
         resolve_sym(target, libpad_handle, "scePadGetDataInternal"),
         resolve_sym(target, libpad_handle,
-                    "scePadGetControllerInformation")
+                    "scePadGetControllerInformation"),
+        resolve_sym(target, libpad_handle,
+                    "scePadGetExtControllerInformation")
     };
     uint8_t fingerprints[6][256];
     memset(fingerprints, 0, sizeof(fingerprints));
@@ -4777,17 +4856,18 @@ wireless_ds4_game_bridge_run_passive(
     uintptr_t local_stub_base = (uintptr_t)game_pad_read_state_stub;
     uintptr_t local_stub_end =
         (uintptr_t)game_pad_bridge_stub_end;
-    const uintptr_t local_stubs[6] = {
+    const uintptr_t local_stubs[7] = {
         (uintptr_t)game_pad_read_state_stub,
         (uintptr_t)game_pad_read_state_ext_stub,
         (uintptr_t)game_pad_read_stub,
         (uintptr_t)game_pad_read_ext_stub,
         (uintptr_t)game_pad_get_data_internal_stub,
-        (uintptr_t)game_pad_get_controller_info_stub
+        (uintptr_t)game_pad_get_controller_info_stub,
+        (uintptr_t)game_pad_get_ext_controller_info_stub
     };
     if (local_stub_end <= local_stub_base)
         goto done;
-    for (unsigned index = 0; index < 6; ++index) {
+    for (unsigned index = 0; index < 7; ++index) {
         if (local_stubs[index] < local_stub_base ||
             local_stubs[index] >= local_stub_end) {
             report_printf(report_fd, "error=stub_layout index=%u\n", index);
@@ -4796,7 +4876,7 @@ wireless_ds4_game_bridge_run_passive(
     }
     size_t stub_size = (size_t)(local_stub_end - local_stub_base);
     size_t gateway_offset = (stub_size + 15u) & ~(size_t)15u;
-    size_t code_size = gateway_offset + 6u * 16u;
+    size_t code_size = gateway_offset + 7u * 16u;
     intptr_t code_address = 0;
     intptr_t args_address = 0;
     size_t code_mapping_size =
@@ -4838,9 +4918,9 @@ wireless_ds4_game_bridge_run_passive(
         report_printf(report_fd, "error=code_write\n");
         goto done;
     }
-    intptr_t remote_stubs[6];
-    static const uint8_t args_in_rcx[6] = {0, 0, 1, 1, 0, 0};
-    for (unsigned index = 0; index < 6; ++index) {
+    intptr_t remote_stubs[7];
+    static const uint8_t args_in_rcx[7] = {0, 0, 1, 1, 0, 0, 0};
+    for (unsigned index = 0; index < 7; ++index) {
         remote_stubs[index] = code_address +
             (intptr_t)(local_stubs[index] - local_stub_base);
         intptr_t gateway = code_address +
@@ -4883,6 +4963,7 @@ wireless_ds4_game_bridge_run_passive(
     args.fp_read_internal = originals[2];
     args.fp_data_internal = originals[4];
     args.fp_get_controller_info_trampoline = originals[5];
+    args.fp_get_ext_controller_info_trampoline = originals[6];
     args.remote_block = code_address;
     args.remote_block_size = (uint32_t)remote_mapping_size;
     args.read_state_address = originals[0];
@@ -5358,7 +5439,7 @@ wireless_ds4_game_bridge_remove(pid_t game_pid, intptr_t args_kaddr)
                 transport_args.import_hook_gateways[index];
             intptr_t current = 0;
             if (slot <= 0 || original <= 0 ||
-                transport_args.import_hook_kinds[index] >= 6u ||
+                transport_args.import_hook_kinds[index] >= 7u ||
                 gateway < transport_args.remote_block ||
                 gateway >= transport_args.remote_block +
                     (intptr_t)transport_args.remote_block_size ||

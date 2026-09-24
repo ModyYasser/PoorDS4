@@ -706,6 +706,7 @@ event_stub_name(uint8_t stub_kind)
     case POORDS4_EVT_KIND_READ_EXT: return "read_ext";
     case POORDS4_EVT_KIND_DATA_INTERNAL: return "data_internal";
     case POORDS4_EVT_KIND_CONTROLLER_INFO: return "controller_info";
+    case POORDS4_EVT_KIND_EXT_CONTROLLER_INFO: return "ext_controller_info";
     default: return "unknown";
     }
 }
