@@ -3,6 +3,29 @@
 All notable changes to this project are documented here. Release tags follow
 Semantic Versioning; wireless-bridge candidates use `0.1.0-rcN`.
 
+## [0.1.0-rc49] - 2026-09-28
+
+### Fixed
+
+- **Universal Multi-DS4 Controller Support (Slots 0..3)**:
+  - Enabled dynamic slot assignment in `wireless_ds4_game_bridge_run_passive`: `ds4_slot = (game_pad_index >= 0 && game_pad_index < 4) ? game_pad_index : 0`. Ensures physical DS4 correctly binds to its assigned player slot without overwriting Slot 0 when a native DualSense is Player 1.
+  - Initialized unassigned slots with handle `-1` and index `-1`, preserving native DualSense slots with `is_dualsense = 1`.
+  - Refactored `game_bridge_find_slot` to only match slots that are `active`, `is_simulated`, or `is_dualsense`. Unopened or unassigned handles (such as `/app0/logiWheel.prx` polling handle `0x036a0701` in Forza Horizon 5) return `-1` to pass directly to native firmware unmodified without raising error dialogs.
+- **Autonomous Multi-Controller Simulation Channel (Slots 0..3)**:
+  - Enhanced `feed_multi_controller_slots` in `game_pad_bridge_main.c` to parse `/data/poords4/simulated_pads.txt` across all 4 slots (0..3). Supports `slots=all`, `slots=none`, or specific slot lists, with configurable buttons (`btn0=..`, `btn1=..`), analog sticks (`lx0=..`, etc.), and analog triggers (`l2_0=..`).
+  - Added simulated input overlay and fallback generation on `primary_slot`, allowing Player 1 and any combination of players 1..4 to be tested completely autonomously directly on console hardware without requiring physical controllers.
+- **Dynamic Slot Role Telemetry**:
+  - Updated status payload and telemetry reporting to identify individual slot roles dynamically (`Primary DS4`, `Native DualSense`, `Simulated DS4`, or `Unassigned/Empty`).
+
+## [0.1.0-rc48] - 2026-09-28
+
+### Added
+
+- **Multi-Controller Slot Infrastructure**:
+  - Expanded `GamePadBridgeArgs` with `GamePadBridgeSlot slots[POORDS4_MAX_SLOTS]` array (4 controller slots).
+  - Implemented per-slot direct pad packet double buffering, atomic sequences, and lease counters.
+  - Added telemetry event ring buffer and per-slot call counters for state, read, and info APIs.
+
 ## [0.1.0-rc47] - 2026-09-24
 
 ### Fixed

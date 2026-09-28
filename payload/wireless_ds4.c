@@ -911,11 +911,13 @@ game_bridge_find_slot(GamePadBridgeArgs *args, int32_t handle)
         return 0;
     int32_t handle_idx = handle & 0xff;
     for (unsigned s = 0; s < POORDS4_MAX_SLOTS; ++s) {
-        if (args->slots[s].pad_index >= 0 && args->slots[s].pad_index == handle_idx)
+        if (args->slots[s].pad_index >= 0 && args->slots[s].pad_index == handle_idx &&
+            (args->slots[s].active || args->slots[s].is_simulated || args->slots[s].is_dualsense))
             return (int)s;
     }
     int32_t legacy_idx = (int32_t)args->reserved0;
-    if (legacy_idx >= 0 && legacy_idx < 24 && handle_idx == legacy_idx)
+    if (legacy_idx >= 0 && legacy_idx < 24 && handle_idx == legacy_idx &&
+        (args->slots[0].active || args->slots[0].is_simulated || args->slots[0].is_dualsense))
         return 0;
     if (handle_idx >= 0 && handle_idx < (int32_t)POORDS4_MAX_SLOTS) {
         if (args->slots[handle_idx].active || args->slots[handle_idx].is_simulated ||
@@ -5277,20 +5279,28 @@ wireless_ds4_game_bridge_run_passive(
         args.observed_handles[i] = -1;
         args.observed_handle_calls[i] = 0;
     }
+    unsigned ds4_slot = (game_pad_index >= 0 && game_pad_index < (int32_t)POORDS4_MAX_SLOTS)
+        ? (unsigned)game_pad_index : 0u;
     for (unsigned i = 0; i < POORDS4_MAX_SLOTS; ++i) {
-        args.slots[i].pad_handle = slot_handles[i];
-        args.slots[i].pad_index = (int32_t)i;
+        if (slot_dualsense[i]) {
+            args.slots[i].pad_handle = slot_handles[i];
+            args.slots[i].pad_index = (int32_t)i;
+            args.slots[i].is_dualsense = 1;
+        } else {
+            args.slots[i].pad_handle = -1;
+            args.slots[i].pad_index = -1;
+            args.slots[i].is_dualsense = 0;
+        }
         args.slots[i].active = 0;
-        args.slots[i].is_dualsense = slot_dualsense[i];
         args.slots[i].is_simulated = 0;
         args.slots[i].direct_seq = 0;
         args.slots[i].direct_lease = 0;
         args.slots[i].direct_packets = 0;
         args.slots[i].last_read_seq = 0;
     }
-    args.slots[0].pad_handle = game_pad_handle;
-    args.slots[0].pad_index = (int32_t)game_pad_index;
-    args.slots[0].is_dualsense = 0;
+    args.slots[ds4_slot].pad_handle = game_pad_handle;
+    args.slots[ds4_slot].pad_index = (int32_t)game_pad_index;
+    args.slots[ds4_slot].is_dualsense = 0;
     args.fp_state_internal = originals[0];
     args.fp_read_internal = originals[2];
     args.fp_data_internal = originals[4];

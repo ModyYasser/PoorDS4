@@ -887,62 +887,128 @@ write_game_session_summary(
     }
 }
 
-static void
-feed_multi_controller_slots(pid_t game_pid, intptr_t bridge_args, uint64_t input_frames)
-{
-    static uint64_t last_check_ms = 0;
-    static int sim_mask = 0;
-    static uint32_t custom_buttons[4] = {0, 0, 0, 0};
-    uint64_t now_ms = monotonic_milliseconds();
+static uint64_t g_sim_last_check_ms = 0;
+static int g_sim_mask = 0;
+static uint32_t g_sim_buttons[POORDS4_MAX_SLOTS] = {0, 0, 0, 0};
+static uint8_t g_sim_lx[POORDS4_MAX_SLOTS] = {128, 128, 128, 128};
+static uint8_t g_sim_ly[POORDS4_MAX_SLOTS] = {128, 128, 128, 128};
+static uint8_t g_sim_rx[POORDS4_MAX_SLOTS] = {128, 128, 128, 128};
+static uint8_t g_sim_ry[POORDS4_MAX_SLOTS] = {128, 128, 128, 128};
+static uint8_t g_sim_l2[POORDS4_MAX_SLOTS] = {0, 0, 0, 0};
+static uint8_t g_sim_r2[POORDS4_MAX_SLOTS] = {0, 0, 0, 0};
 
-    if (now_ms - last_check_ms >= 500u || last_check_ms == 0) {
-        last_check_ms = now_ms;
-        int fd = open("/data/poords4/simulated_pads.txt", O_RDONLY);
-        if (fd >= 0) {
-            char buf[512];
-            ssize_t n = read(fd, buf, sizeof(buf) - 1);
-            close(fd);
-            if (n > 0) {
-                buf[n] = '\0';
-                sim_mask = 0;
-                custom_buttons[1] = 0;
-                custom_buttons[2] = 0;
-                custom_buttons[3] = 0;
-                if (strstr(buf, "slots=all") || strstr(buf, "all")) {
-                    sim_mask = (1 << 1) | (1 << 2) | (1 << 3);
-                } else {
-                    if (strstr(buf, "1")) sim_mask |= (1 << 1);
-                    if (strstr(buf, "2")) sim_mask |= (1 << 2);
-                    if (strstr(buf, "3")) sim_mask |= (1 << 3);
-                }
-                char *p_b1 = strstr(buf, "btn1=");
-                if (p_b1) custom_buttons[1] = (uint32_t)strtoul(p_b1 + 5, NULL, 0);
-                char *p_b2 = strstr(buf, "btn2=");
-                if (p_b2) custom_buttons[2] = (uint32_t)strtoul(p_b2 + 5, NULL, 0);
-                char *p_b3 = strstr(buf, "btn3=");
-                if (p_b3) custom_buttons[3] = (uint32_t)strtoul(p_b3 + 5, NULL, 0);
-            }
-        } else {
-            sim_mask = 0;
-        }
+static void
+refresh_simulated_pads_config(void)
+{
+    uint64_t now_ms = monotonic_milliseconds();
+    if (now_ms - g_sim_last_check_ms < 500u && g_sim_last_check_ms != 0)
+        return;
+    g_sim_last_check_ms = now_ms;
+
+    int fd = open("/data/poords4/simulated_pads.txt", O_RDONLY);
+    if (fd < 0) {
+        g_sim_mask = 0;
+        return;
+    }
+    char buf[1024];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) {
+        g_sim_mask = 0;
+        return;
+    }
+    buf[n] = '\0';
+    g_sim_mask = 0;
+    for (unsigned s = 0; s < POORDS4_MAX_SLOTS; ++s) {
+        g_sim_buttons[s] = 0;
+        g_sim_lx[s] = 128;
+        g_sim_ly[s] = 128;
+        g_sim_rx[s] = 128;
+        g_sim_ry[s] = 128;
+        g_sim_l2[s] = 0;
+        g_sim_r2[s] = 0;
     }
 
-    if (sim_mask == 0)
+    if (strstr(buf, "slots=none")) {
+        g_sim_mask = 0;
+        return;
+    }
+
+    char *p_slots = strstr(buf, "slots=");
+    if (strstr(buf, "slots=all") || (p_slots && strstr(p_slots, "all"))) {
+        g_sim_mask = 0x0f;
+    } else if (p_slots) {
+        char *end = strchr(p_slots, '\n');
+        size_t len = end ? (size_t)(end - p_slots) : strlen(p_slots);
+        char line[128];
+        if (len >= sizeof(line)) len = sizeof(line) - 1;
+        memcpy(line, p_slots, len);
+        line[len] = '\0';
+        for (unsigned s = 0; s < POORDS4_MAX_SLOTS; ++s) {
+            char digit = (char)('0' + s);
+            if (strchr(line + 6, digit))
+                g_sim_mask |= (1 << s);
+        }
+    } else if (strstr(buf, "all")) {
+        g_sim_mask = 0x0f;
+    }
+
+    for (unsigned s = 0; s < POORDS4_MAX_SLOTS; ++s) {
+        char key[16];
+        snprintf(key, sizeof(key), "btn%u=", s);
+        char *p = strstr(buf, key);
+        if (p) g_sim_buttons[s] = (uint32_t)strtoul(p + strlen(key), NULL, 0);
+
+        snprintf(key, sizeof(key), "lx%u=", s);
+        p = strstr(buf, key);
+        if (p) g_sim_lx[s] = (uint8_t)strtoul(p + strlen(key), NULL, 0);
+
+        snprintf(key, sizeof(key), "ly%u=", s);
+        p = strstr(buf, key);
+        if (p) g_sim_ly[s] = (uint8_t)strtoul(p + strlen(key), NULL, 0);
+
+        snprintf(key, sizeof(key), "rx%u=", s);
+        p = strstr(buf, key);
+        if (p) g_sim_rx[s] = (uint8_t)strtoul(p + strlen(key), NULL, 0);
+
+        snprintf(key, sizeof(key), "ry%u=", s);
+        p = strstr(buf, key);
+        if (p) g_sim_ry[s] = (uint8_t)strtoul(p + strlen(key), NULL, 0);
+
+        snprintf(key, sizeof(key), "l2_%u=", s);
+        p = strstr(buf, key);
+        if (p) g_sim_l2[s] = (uint8_t)strtoul(p + strlen(key), NULL, 0);
+
+        snprintf(key, sizeof(key), "r2_%u=", s);
+        p = strstr(buf, key);
+        if (p) g_sim_r2[s] = (uint8_t)strtoul(p + strlen(key), NULL, 0);
+    }
+}
+
+static void
+feed_multi_controller_slots(pid_t game_pid, intptr_t bridge_args,
+                            uint64_t input_frames, unsigned primary_slot)
+{
+    refresh_simulated_pads_config();
+    if (g_sim_mask == 0)
         return;
 
-    for (unsigned s = 1; s < POORDS4_MAX_SLOTS; ++s) {
-        if (!(sim_mask & (1 << s)))
+    uint64_t now_ms = monotonic_milliseconds();
+    for (unsigned s = 0; s < POORDS4_MAX_SLOTS; ++s) {
+        if (s == primary_slot)
+            continue;
+        if (!(g_sim_mask & (1 << s)))
             continue;
 
         ScePadData sim_pad;
         memset(&sim_pad, 0, sizeof(sim_pad));
-        sim_pad.buttons = custom_buttons[s];
-        sim_pad.leftStick.x = 128;
-        sim_pad.leftStick.y = 128;
-        sim_pad.rightStick.x = 128;
-        sim_pad.rightStick.y = 128;
-        sim_pad.analogButtons.l2 = 0;
-        sim_pad.analogButtons.r2 = 0;
+        sim_pad.buttons = g_sim_buttons[s];
+        sim_pad.leftStick.x = g_sim_lx[s];
+        sim_pad.leftStick.y = g_sim_ly[s];
+        sim_pad.rightStick.x = g_sim_rx[s];
+        sim_pad.rightStick.y = g_sim_ry[s];
+        sim_pad.analogButtons.l2 = g_sim_l2[s];
+        sim_pad.analogButtons.r2 = g_sim_r2[s];
         sim_pad.connected = 1;
         sim_pad.timestamp = (uint64_t)now_ms * 1000u;
         sim_pad.count = (uint8_t)(input_frames & 0xff);
@@ -995,15 +1061,48 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
     GameSessionEndReason end_reason = SESSION_END_STOP_REQUESTED;
     uint64_t session_start_ms = monotonic_milliseconds();
     g_bridge_args = bridge_args;
+    PoorDS4GameBridgeStatus initial_status;
+    unsigned primary_slot = 0;
+    if (wireless_ds4_game_bridge_status(game_pid, bridge_args, &initial_status) == 0 &&
+        initial_status.game_pad_index >= 0 && initial_status.game_pad_index < (int32_t)POORDS4_MAX_SLOTS) {
+        primary_slot = (unsigned)initial_status.game_pad_index;
+    } else if (g_pad_source.pad_index >= 0 && g_pad_source.pad_index < (int32_t)POORDS4_MAX_SLOTS) {
+        primary_slot = (unsigned)g_pad_source.pad_index;
+    }
     write_supervisor_state(
         "active", game_pid, session, previous_output_frames, 1);
     while (!lifecycle_should_stop()) {
         ScePadData pad;
         uint32_t seq = 0;
         memset(&pad, 0, sizeof(pad));
-        if (wireless_ds4_remote_reader_read(
-                reader_pid, reader_args, &pad, sizeof(pad), &seq) == 0) {
+        refresh_simulated_pads_config();
+        int sim_on_primary = (g_sim_mask & (1 << primary_slot)) != 0;
+
+        int read_result = wireless_ds4_remote_reader_read(
+            reader_pid, reader_args, &pad, sizeof(pad), &seq);
+        if (read_result == 0 || sim_on_primary) {
             consecutive_read_failures = 0;
+            if (read_result != 0 && sim_on_primary) {
+                memset(&pad, 0, sizeof(pad));
+                pad.leftStick.x = 128;
+                pad.leftStick.y = 128;
+                pad.rightStick.x = 128;
+                pad.rightStick.y = 128;
+                pad.connected = 1;
+                pad.timestamp = (uint64_t)monotonic_milliseconds() * 1000u;
+                pad.count = (uint8_t)(input_frames & 0xff);
+                seq = (uint32_t)input_frames + 1u;
+            }
+            if (sim_on_primary) {
+                pad.buttons |= g_sim_buttons[primary_slot];
+                if (g_sim_lx[primary_slot] != 128) pad.leftStick.x = g_sim_lx[primary_slot];
+                if (g_sim_ly[primary_slot] != 128) pad.leftStick.y = g_sim_ly[primary_slot];
+                if (g_sim_rx[primary_slot] != 128) pad.rightStick.x = g_sim_rx[primary_slot];
+                if (g_sim_ry[primary_slot] != 128) pad.rightStick.y = g_sim_ry[primary_slot];
+                if (g_sim_l2[primary_slot] != 0) pad.analogButtons.l2 = g_sim_l2[primary_slot];
+                if (g_sim_r2[primary_slot] != 0) pad.analogButtons.r2 = g_sim_r2[primary_slot];
+                pad.connected = 1;
+            }
             if (seq != last_seq) {
                 input_frames++;
                 if (pad.touchData.fingers == 0) {
@@ -1172,16 +1271,17 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
                     disconnect_frames = 0;
                     disconnect_grace_expired = 0;
                 }
-                if (wireless_ds4_game_bridge_update(
-                        game_pid, bridge_args,
-                        &pad, sizeof(pad)) == 0) {
+                if (wireless_ds4_game_bridge_update_slot(
+                        game_pid, bridge_args, primary_slot,
+                        &pad, sizeof(pad),
+                        sim_on_primary ? 1 : 0, 0) == 0) {
                     output_frames++;
                     consecutive_write_failures = 0;
                 } else {
                     write_failures++;
                     consecutive_write_failures++;
                 }
-                feed_multi_controller_slots(game_pid, bridge_args, input_frames);
+                feed_multi_controller_slots(game_pid, bridge_args, input_frames, primary_slot);
                 last_seq = seq;
             } else {
                 stale_frames++;
