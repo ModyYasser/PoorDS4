@@ -5645,6 +5645,36 @@ wireless_ds4_game_bridge_update_slot(pid_t game_pid, intptr_t args_kaddr,
 }
 
 int
+wireless_ds4_game_bridge_deactivate_slot(pid_t game_pid, intptr_t args_kaddr,
+                                        uint32_t slot_idx)
+{
+#if !defined(__PROSPERO__)
+    (void)game_pid; (void)args_kaddr; (void)slot_idx;
+    return -1;
+#else
+    if (game_pid <= 0 || !args_kaddr || slot_idx >= POORDS4_MAX_SLOTS)
+        return -1;
+    intptr_t slot_base = args_kaddr + (intptr_t)offsetof(GamePadBridgeArgs, slots) +
+        (intptr_t)slot_idx * (intptr_t)sizeof(GamePadBridgeSlot);
+    struct {
+        uint32_t active;
+        uint32_t is_dualsense;
+        uint32_t is_simulated;
+        uint32_t direct_seq;
+        uint32_t direct_lease;
+    } slot_pub;
+    slot_pub.active = 0u;
+    slot_pub.is_dualsense = 0u;
+    slot_pub.is_simulated = 0u;
+    slot_pub.direct_seq = 0u;
+    slot_pub.direct_lease = 0u;
+    return game_bridge_process_write(
+        game_pid, slot_base + (intptr_t)offsetof(GamePadBridgeSlot, active),
+        &slot_pub, sizeof(slot_pub));
+#endif
+}
+
+int
 wireless_ds4_game_bridge_update(pid_t game_pid, intptr_t args_kaddr,
                                 const void *pad_data,
                                 uint32_t pad_data_len)

@@ -989,34 +989,35 @@ static void
 feed_multi_controller_slots(pid_t game_pid, intptr_t bridge_args,
                             uint64_t input_frames, unsigned primary_slot)
 {
+    static int s_prev_sim_mask = 0;
     refresh_simulated_pads_config();
-    if (g_sim_mask == 0)
-        return;
 
     uint64_t now_ms = monotonic_milliseconds();
     for (unsigned s = 0; s < POORDS4_MAX_SLOTS; ++s) {
         if (s == primary_slot)
             continue;
-        if (!(g_sim_mask & (1 << s)))
-            continue;
+        if (g_sim_mask & (1 << s)) {
+            ScePadData sim_pad;
+            memset(&sim_pad, 0, sizeof(sim_pad));
+            sim_pad.buttons = g_sim_buttons[s];
+            sim_pad.leftStick.x = g_sim_lx[s];
+            sim_pad.leftStick.y = g_sim_ly[s];
+            sim_pad.rightStick.x = g_sim_rx[s];
+            sim_pad.rightStick.y = g_sim_ry[s];
+            sim_pad.analogButtons.l2 = g_sim_l2[s];
+            sim_pad.analogButtons.r2 = g_sim_r2[s];
+            sim_pad.connected = 1;
+            sim_pad.timestamp = (uint64_t)now_ms * 1000u;
+            sim_pad.count = (uint8_t)(input_frames & 0xff);
 
-        ScePadData sim_pad;
-        memset(&sim_pad, 0, sizeof(sim_pad));
-        sim_pad.buttons = g_sim_buttons[s];
-        sim_pad.leftStick.x = g_sim_lx[s];
-        sim_pad.leftStick.y = g_sim_ly[s];
-        sim_pad.rightStick.x = g_sim_rx[s];
-        sim_pad.rightStick.y = g_sim_ry[s];
-        sim_pad.analogButtons.l2 = g_sim_l2[s];
-        sim_pad.analogButtons.r2 = g_sim_r2[s];
-        sim_pad.connected = 1;
-        sim_pad.timestamp = (uint64_t)now_ms * 1000u;
-        sim_pad.count = (uint8_t)(input_frames & 0xff);
-
-        (void)wireless_ds4_game_bridge_update_slot(
-            game_pid, bridge_args, s, &sim_pad, sizeof(sim_pad),
-            1 /* is_simulated */, 0 /* is_dualsense */);
+            (void)wireless_ds4_game_bridge_update_slot(
+                game_pid, bridge_args, s, &sim_pad, sizeof(sim_pad),
+                1 /* is_simulated */, 0 /* is_dualsense */);
+        } else if (s_prev_sim_mask & (1 << s)) {
+            (void)wireless_ds4_game_bridge_deactivate_slot(game_pid, bridge_args, s);
+        }
     }
+    s_prev_sim_mask = g_sim_mask;
 }
 
 static unsigned

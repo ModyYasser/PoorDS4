@@ -73,6 +73,8 @@ int wireless_ds4_game_bridge_update_slot(pid_t game_pid, intptr_t args_address,
                                         uint32_t pad_data_len,
                                         int is_simulated,
                                         int is_dualsense);
+int wireless_ds4_game_bridge_deactivate_slot(pid_t game_pid, intptr_t args_address,
+                                            uint32_t slot_idx);
 int wireless_ds4_game_bridge_abandon(void);
 
 #define POORDS4_GAME_BRIDGE_EVENT_RING_SIZE 64u
