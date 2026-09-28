@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -886,6 +887,72 @@ write_game_session_summary(
     }
 }
 
+static void
+feed_multi_controller_slots(pid_t game_pid, intptr_t bridge_args, uint64_t input_frames)
+{
+    static uint64_t last_check_ms = 0;
+    static int sim_mask = 0;
+    static uint32_t custom_buttons[4] = {0, 0, 0, 0};
+    uint64_t now_ms = monotonic_milliseconds();
+
+    if (now_ms - last_check_ms >= 500u || last_check_ms == 0) {
+        last_check_ms = now_ms;
+        int fd = open("/data/poords4/simulated_pads.txt", O_RDONLY);
+        if (fd >= 0) {
+            char buf[512];
+            ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            close(fd);
+            if (n > 0) {
+                buf[n] = '\0';
+                sim_mask = 0;
+                custom_buttons[1] = 0;
+                custom_buttons[2] = 0;
+                custom_buttons[3] = 0;
+                if (strstr(buf, "slots=all") || strstr(buf, "all")) {
+                    sim_mask = (1 << 1) | (1 << 2) | (1 << 3);
+                } else {
+                    if (strstr(buf, "1")) sim_mask |= (1 << 1);
+                    if (strstr(buf, "2")) sim_mask |= (1 << 2);
+                    if (strstr(buf, "3")) sim_mask |= (1 << 3);
+                }
+                char *p_b1 = strstr(buf, "btn1=");
+                if (p_b1) custom_buttons[1] = (uint32_t)strtoul(p_b1 + 5, NULL, 0);
+                char *p_b2 = strstr(buf, "btn2=");
+                if (p_b2) custom_buttons[2] = (uint32_t)strtoul(p_b2 + 5, NULL, 0);
+                char *p_b3 = strstr(buf, "btn3=");
+                if (p_b3) custom_buttons[3] = (uint32_t)strtoul(p_b3 + 5, NULL, 0);
+            }
+        } else {
+            sim_mask = 0;
+        }
+    }
+
+    if (sim_mask == 0)
+        return;
+
+    for (unsigned s = 1; s < POORDS4_MAX_SLOTS; ++s) {
+        if (!(sim_mask & (1 << s)))
+            continue;
+
+        ScePadData sim_pad;
+        memset(&sim_pad, 0, sizeof(sim_pad));
+        sim_pad.buttons = custom_buttons[s];
+        sim_pad.leftStick.x = 128;
+        sim_pad.leftStick.y = 128;
+        sim_pad.rightStick.x = 128;
+        sim_pad.rightStick.y = 128;
+        sim_pad.analogButtons.l2 = 0;
+        sim_pad.analogButtons.r2 = 0;
+        sim_pad.connected = 1;
+        sim_pad.timestamp = (uint64_t)now_ms * 1000u;
+        sim_pad.count = (uint8_t)(input_frames & 0xff);
+
+        (void)wireless_ds4_game_bridge_update_slot(
+            game_pid, bridge_args, s, &sim_pad, sizeof(sim_pad),
+            1 /* is_simulated */, 0 /* is_dualsense */);
+    }
+}
+
 static unsigned
 run_game_session(pid_t reader_pid, intptr_t reader_args,
                  pid_t game_pid, intptr_t bridge_args,
@@ -1114,6 +1181,7 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
                     write_failures++;
                     consecutive_write_failures++;
                 }
+                feed_multi_controller_slots(game_pid, bridge_args, input_frames);
                 last_seq = seq;
             } else {
                 stale_frames++;

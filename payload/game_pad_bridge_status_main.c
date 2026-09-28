@@ -214,6 +214,18 @@ main(void)
                 (unsigned long long)bridge.observed_handle_calls[i]);
     }
 
+    fprintf(f, "--- multi-controller slots ---\n");
+    for (unsigned s = 0; s < POORDS4_MAX_SLOTS; ++s) {
+        const PoorDS4SlotStatus *sl = &bridge.slots[s];
+        const char *role = (s == 0) ? "Player 1 (Primary DS4)" :
+                           (sl->is_dualsense ? "Native DualSense" :
+                           (sl->is_simulated ? "Simulated DS4" : "Unassigned/Empty"));
+        fprintf(f, "slot[%u]: role='%s' active=%u handle=0x%08x dualsense=%u sim=%u seq=%u pkts=%u calls[state=%llu,read=%llu] fallback_frames=%llu passthrough=%llu\n",
+                s, role, sl->active, (uint32_t)sl->pad_handle, sl->is_dualsense, sl->is_simulated,
+                sl->seq, sl->packets, (unsigned long long)sl->read_state_calls, (unsigned long long)sl->read_calls,
+                (unsigned long long)sl->direct_fallback_frames, (unsigned long long)sl->native_passthrough_frames);
+    }
+
     fprintf(f, "--- last events (ring buffer) ---\n");
     fprintf(f, "Seq    | Timestamp (ms) | Delta | API Stub        | Handle     | Flags | Sticks (L/R)        | Triggers | Buttons\n");
     fprintf(f, "-------+----------------+-------+-----------------+------------+-------+---------------------+----------+-------------------------\n");

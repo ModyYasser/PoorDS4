@@ -58,6 +58,8 @@ int wireless_ds4_remote_reader_status(
     pid_t pid, intptr_t args_address,
     PoorDS4RemoteReaderStatus *out_status);
 
+#define POORDS4_MAX_SLOTS 4u
+
 int wireless_ds4_game_bridge_install(
     const PoorDS4PadSource *source, pid_t *out_game_pid,
     intptr_t *out_args_address);
@@ -65,6 +67,12 @@ int wireless_ds4_game_bridge_find_target(pid_t *out_game_pid);
 int wireless_ds4_game_bridge_update(pid_t game_pid, intptr_t args_address,
                                    const void *pad_data,
                                    uint32_t pad_data_len);
+int wireless_ds4_game_bridge_update_slot(pid_t game_pid, intptr_t args_address,
+                                        uint32_t slot_idx,
+                                        const void *pad_data,
+                                        uint32_t pad_data_len,
+                                        int is_simulated,
+                                        int is_dualsense);
 int wireless_ds4_game_bridge_abandon(void);
 
 #define POORDS4_GAME_BRIDGE_EVENT_RING_SIZE 64u
@@ -96,6 +104,29 @@ typedef struct {
     uint8_t stub_kind;
     uint8_t flags;
 } PoorDS4InputEvent;
+
+typedef struct {
+    int32_t  pad_handle;
+    int32_t  pad_index;
+    uint32_t active;
+    uint32_t is_dualsense;
+    uint32_t is_simulated;
+    uint32_t seq;
+    uint32_t packets;
+    uint64_t read_state_calls;
+    uint64_t read_calls;
+    uint64_t direct_fallback_frames;
+    uint64_t native_passthrough_frames;
+    uint32_t buttons;
+    uint8_t  lx;
+    uint8_t  ly;
+    uint8_t  rx;
+    uint8_t  ry;
+    uint8_t  l2;
+    uint8_t  r2;
+    uint8_t  connected;
+    uint8_t  reserved[3];
+} PoorDS4SlotStatus;
 
 typedef struct {
     uint32_t layout_marker;
@@ -150,6 +181,7 @@ typedef struct {
     uint64_t observed_handle_calls[4];
     uint32_t event_ring_head;
     PoorDS4InputEvent event_ring[POORDS4_GAME_BRIDGE_EVENT_RING_SIZE];
+    PoorDS4SlotStatus slots[POORDS4_MAX_SLOTS];
 } PoorDS4GameBridgeStatus;
 
 int wireless_ds4_game_bridge_status(pid_t game_pid, intptr_t args_address,

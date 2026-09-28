@@ -734,6 +734,27 @@ remote_pad_reader_stub_end(void)
 #define POORDS4_GAME_BRIDGE_DIRECT_LEASE 2048u
 
 typedef struct {
+    int32_t  pad_handle;
+    int32_t  pad_index;
+    volatile uint32_t active;
+    uint32_t is_dualsense;
+    uint32_t is_simulated;
+    volatile uint32_t direct_seq;
+    volatile uint32_t direct_lease;
+    volatile uint32_t direct_packets;
+    uint8_t  direct_pad_data[2][POORDS4_GAME_BRIDGE_PAD_SIZE];
+    volatile uint64_t read_state_calls;
+    volatile uint64_t read_state_ext_calls;
+    volatile uint64_t read_calls;
+    volatile uint64_t read_ext_calls;
+    volatile uint64_t data_internal_calls;
+    volatile uint64_t direct_fallback_frames;
+    volatile uint64_t native_passthrough_frames;
+    volatile uint32_t last_read_seq;
+    uint32_t reserved[3];
+} GamePadBridgeSlot;
+
+typedef struct {
     uint32_t magic;
     volatile uint32_t active;
     volatile uint32_t seq;
@@ -844,17 +865,20 @@ typedef struct {
     volatile uint64_t observed_handle_calls[4];
     volatile uint32_t event_ring_head;
     PoorDS4InputEvent event_ring[POORDS4_GAME_BRIDGE_EVENT_RING_SIZE];
+    GamePadBridgeSlot slots[POORDS4_MAX_SLOTS];
 } GamePadBridgeArgs;
 
 _Static_assert(offsetof(GamePadBridgeArgs, legacy_fp_setsockopt) == 496,
                "PoorDS4 bridge ABI v1 prefix changed");
-_Static_assert(sizeof(GamePadBridgeArgs) == 4592,
+_Static_assert(sizeof(GamePadBridgeArgs) == 5968,
                "GamePadBridgeArgs ABI changed");
 
 static pid_t g_game_bridge_direct_pid = -1;
 static intptr_t g_game_bridge_direct_args = 0;
 static uint32_t g_game_bridge_direct_seq = 0;
 static uint32_t g_game_bridge_direct_packets = 0;
+static uint32_t g_game_bridge_slot_seq[POORDS4_MAX_SLOTS] = {0};
+static uint32_t g_game_bridge_slot_packets[POORDS4_MAX_SLOTS] = {0};
 static uint64_t g_game_bridge_direct_cr3 = 0;
 static uint64_t g_game_bridge_direct_dmap = 0;
 
@@ -875,28 +899,84 @@ extern int32_t game_pad_get_ext_controller_info_stub(
 extern void game_pad_bridge_stub_end(void);
 
 static __attribute__((always_inline)) inline int
-game_bridge_direct_available(GamePadBridgeArgs *args)
+game_bridge_find_slot(GamePadBridgeArgs *args, int32_t handle)
 {
-    if (!args || args->reserved1 != POORDS4_GAME_BRIDGE_LAYOUT_V1 ||
-        !__atomic_load_n(&args->direct_active, __ATOMIC_ACQUIRE))
-        return 0;
-    uint32_t lease = __atomic_load_n(
-        &args->direct_lease, __ATOMIC_RELAXED);
-    while (lease != 0) {
-        if (__atomic_compare_exchange_n(
-                &args->direct_lease, &lease, lease - 1u, 0,
-                __ATOMIC_RELAXED, __ATOMIC_RELAXED))
-            return 1;
+    if (!args || handle <= 0 || (handle & 0xffffff00) == 0)
+        return -1;
+    for (unsigned s = 0; s < POORDS4_MAX_SLOTS; ++s) {
+        if (args->slots[s].pad_handle > 0 && args->slots[s].pad_handle == handle)
+            return (int)s;
     }
-    if (__atomic_exchange_n(
-            &args->direct_active, 0, __ATOMIC_ACQ_REL) != 0)
-        (void)__atomic_fetch_add(
-            &args->lease_expirations, 1,
-            __ATOMIC_RELAXED);
-    return 0;
+    if (args->pad_handle > 0 && handle == args->pad_handle)
+        return 0;
+    int32_t handle_idx = handle & 0xff;
+    for (unsigned s = 0; s < POORDS4_MAX_SLOTS; ++s) {
+        if (args->slots[s].pad_index >= 0 && args->slots[s].pad_index == handle_idx)
+            return (int)s;
+    }
+    int32_t legacy_idx = (int32_t)args->reserved0;
+    if (legacy_idx >= 0 && legacy_idx < 24 && handle_idx == legacy_idx)
+        return 0;
+    if (handle_idx >= 0 && handle_idx < (int32_t)POORDS4_MAX_SLOTS) {
+        if (args->slots[handle_idx].active || args->slots[handle_idx].is_simulated ||
+            args->slots[handle_idx].is_dualsense) {
+            if (args->slots[handle_idx].pad_handle <= 0)
+                args->slots[handle_idx].pad_handle = handle;
+            if (args->slots[handle_idx].pad_index < 0)
+                args->slots[handle_idx].pad_index = handle_idx;
+            return handle_idx;
+        }
+    }
+    return -1;
 }
 
 static __attribute__((always_inline)) inline int
+game_bridge_direct_available_slot(GamePadBridgeArgs *args, unsigned slot)
+{
+    if (!args || slot >= POORDS4_MAX_SLOTS ||
+        args->reserved1 != POORDS4_GAME_BRIDGE_LAYOUT_V1)
+        return 0;
+    if (slot == 0) {
+        if (__atomic_load_n(&args->slots[0].active, __ATOMIC_ACQUIRE)) {
+            uint32_t lease = __atomic_load_n(&args->slots[0].direct_lease, __ATOMIC_RELAXED);
+            while (lease != 0) {
+                if (__atomic_compare_exchange_n(&args->slots[0].direct_lease, &lease, lease - 1u, 0,
+                                                __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+                    return 1;
+            }
+        }
+        if (!__atomic_load_n(&args->direct_active, __ATOMIC_ACQUIRE))
+            return 0;
+        uint32_t lease = __atomic_load_n(&args->direct_lease, __ATOMIC_RELAXED);
+        while (lease != 0) {
+            if (__atomic_compare_exchange_n(&args->direct_lease, &lease, lease - 1u, 0,
+                                            __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+                return 1;
+        }
+        if (__atomic_exchange_n(&args->direct_active, 0, __ATOMIC_ACQ_REL) != 0)
+            (void)__atomic_fetch_add(&args->lease_expirations, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+    if (!__atomic_load_n(&args->slots[slot].active, __ATOMIC_ACQUIRE))
+        return 0;
+    uint32_t lease = __atomic_load_n(&args->slots[slot].direct_lease, __ATOMIC_RELAXED);
+    while (lease != 0) {
+        if (__atomic_compare_exchange_n(&args->slots[slot].direct_lease, &lease, lease - 1u, 0,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return 1;
+    }
+    if (__atomic_exchange_n(&args->slots[slot].active, 0, __ATOMIC_ACQ_REL) != 0)
+        (void)__atomic_fetch_add(&args->lease_expirations, 1, __ATOMIC_RELAXED);
+    return 0;
+}
+
+static __attribute__((always_inline, unused)) inline int
+game_bridge_direct_available(GamePadBridgeArgs *args)
+{
+    return game_bridge_direct_available_slot(args, 0);
+}
+
+static __attribute__((always_inline, unused)) inline int
 game_bridge_handle_matches(GamePadBridgeArgs *args, int32_t handle)
 {
     if (!args || handle <= 0 || (handle & 0xffffff00) == 0)
@@ -909,63 +989,91 @@ game_bridge_handle_matches(GamePadBridgeArgs *args, int32_t handle)
      * table entry.  Following that slot keeps P2 alive across a handle
      * generation change without ever matching the connected P1 entry. */
     int32_t index = (int32_t)args->reserved0;
-    return index >= 0 && index < 24 && (handle & 0xff) == index;
+    if (index >= 0 && index < 24 && (handle & 0xff) == index)
+        return 1;
+    return game_bridge_find_slot(args, handle) >= 0;
 }
 
 static __attribute__((always_inline)) inline int
-game_bridge_copy_direct(GamePadBridgeArgs *args, void *out,
-                        volatile uint64_t *call_counter)
+game_bridge_copy_direct_slot(GamePadBridgeArgs *args, unsigned slot, void *out,
+                             volatile uint64_t *call_counter,
+                             volatile uint64_t *slot_counter)
 {
+    if (!args || slot >= POORDS4_MAX_SLOTS)
+        return 0;
     volatile uint8_t *destination = (volatile uint8_t *)out;
-    for (unsigned attempt = 0;
-         attempt < POORDS4_GAME_BRIDGE_SNAPSHOT_RETRIES; ++attempt) {
-        uint32_t before = __atomic_load_n(
-            &args->direct_seq, __ATOMIC_ACQUIRE);
-        for (unsigned byte = 0;
-             byte < POORDS4_GAME_BRIDGE_PAD_SIZE; ++byte)
-            destination[byte] =
-                args->direct_pad_data[before & 1u][byte];
-        if (before == __atomic_load_n(
-                &args->direct_seq, __ATOMIC_ACQUIRE)) {
-            (void)__atomic_fetch_add(
-                call_counter, 1, __ATOMIC_RELAXED);
+
+    volatile uint32_t *p_seq = (slot == 0 && args->slots[0].direct_packets == 0)
+        ? &args->direct_seq : &args->slots[slot].direct_seq;
+    volatile uint32_t *p_active = (slot == 0 && args->slots[0].direct_packets == 0)
+        ? &args->direct_active : &args->slots[slot].active;
+
+    for (unsigned attempt = 0; attempt < POORDS4_GAME_BRIDGE_SNAPSHOT_RETRIES; ++attempt) {
+        uint32_t before = __atomic_load_n(p_seq, __ATOMIC_ACQUIRE);
+        const uint8_t *src = (slot == 0 && args->slots[0].direct_packets == 0)
+            ? args->direct_pad_data[before & 1u]
+            : args->slots[slot].direct_pad_data[before & 1u];
+        for (unsigned byte = 0; byte < POORDS4_GAME_BRIDGE_PAD_SIZE; ++byte)
+            destination[byte] = src[byte];
+        if (before == __atomic_load_n(p_seq, __ATOMIC_ACQUIRE)) {
+            if (call_counter)
+                (void)__atomic_fetch_add(call_counter, 1, __ATOMIC_RELAXED);
+            if (slot_counter)
+                (void)__atomic_fetch_add(slot_counter, 1, __ATOMIC_RELAXED);
+            (void)__atomic_fetch_add(&args->slots[slot].direct_fallback_frames, 1, __ATOMIC_RELAXED);
             return 1;
         }
         __asm__ __volatile__("pause" ::: "memory");
     }
-    if (!__atomic_load_n(
-            &args->direct_active, __ATOMIC_ACQUIRE))
+    if (!__atomic_load_n(p_active, __ATOMIC_ACQUIRE))
         return 0;
-    uint32_t current = __atomic_load_n(
-        &args->direct_seq, __ATOMIC_ACQUIRE);
-    for (unsigned byte = 0;
-         byte < POORDS4_GAME_BRIDGE_PAD_SIZE; ++byte)
-        destination[byte] =
-            args->direct_pad_data[current & 1u][byte];
+    uint32_t current = __atomic_load_n(p_seq, __ATOMIC_ACQUIRE);
+    const uint8_t *src = (slot == 0 && args->slots[0].direct_packets == 0)
+        ? args->direct_pad_data[current & 1u]
+        : args->slots[slot].direct_pad_data[current & 1u];
+    for (unsigned byte = 0; byte < POORDS4_GAME_BRIDGE_PAD_SIZE; ++byte)
+        destination[byte] = src[byte];
     destination[offsetof(ScePadData, connected)] = 1;
-    (void)__atomic_fetch_add(
-        &args->snapshot_contention_fallbacks, 1, __ATOMIC_RELAXED);
-    (void)__atomic_fetch_add(call_counter, 1, __ATOMIC_RELAXED);
+    (void)__atomic_fetch_add(&args->snapshot_contention_fallbacks, 1, __ATOMIC_RELAXED);
+    if (call_counter)
+        (void)__atomic_fetch_add(call_counter, 1, __ATOMIC_RELAXED);
+    if (slot_counter)
+        (void)__atomic_fetch_add(slot_counter, 1, __ATOMIC_RELAXED);
+    (void)__atomic_fetch_add(&args->slots[slot].direct_fallback_frames, 1, __ATOMIC_RELAXED);
     return 1;
 }
 
-static __attribute__((always_inline)) inline int
-game_bridge_direct_controls_active(GamePadBridgeArgs *args)
+static __attribute__((always_inline, unused)) inline int
+game_bridge_copy_direct(GamePadBridgeArgs *args, void *out,
+                        volatile uint64_t *call_counter)
 {
-    uint32_t sequence = __atomic_load_n(
-        &args->direct_seq, __ATOMIC_ACQUIRE);
-    volatile uint8_t *pad =
-        args->direct_pad_data[sequence & 1u];
+    return game_bridge_copy_direct_slot(args, 0, out, call_counter, NULL);
+}
+
+static __attribute__((always_inline)) inline int
+game_bridge_direct_controls_active_slot(GamePadBridgeArgs *args, unsigned slot)
+{
+    if (!args || slot >= POORDS4_MAX_SLOTS)
+        return 0;
+    volatile uint32_t *p_seq = (slot == 0 && args->slots[0].direct_packets == 0)
+        ? &args->direct_seq : &args->slots[slot].direct_seq;
+    uint32_t sequence = __atomic_load_n(p_seq, __ATOMIC_ACQUIRE);
+    const volatile uint8_t *pad = (slot == 0 && args->slots[0].direct_packets == 0)
+        ? args->direct_pad_data[sequence & 1u]
+        : args->slots[slot].direct_pad_data[sequence & 1u];
     uint32_t buttons = (uint32_t)pad[0] |
         ((uint32_t)pad[1] << 8u) |
         ((uint32_t)pad[2] << 16u) |
         ((uint32_t)pad[3] << 24u);
     if (buttons != 0 || pad[8] != 0 || pad[9] != 0)
         return 1;
-    /* Raw stick centers differ by controller and drift naturally. Meaningful
-     * axis transitions are diagnosed by the supervisor, while this counter is
-     * deliberately limited to unambiguous buttons/triggers. */
     return 0;
+}
+
+static __attribute__((always_inline, unused)) inline int
+game_bridge_direct_controls_active(GamePadBridgeArgs *args)
+{
+    return game_bridge_direct_controls_active_slot(args, 0);
 }
 
 static __attribute__((always_inline)) inline int
@@ -1141,50 +1249,83 @@ game_pad_read_state_stub(int32_t handle, void *out,
     int32_t native_result = (int32_t)0x80920001u;
     int32_t final_result = 0;
     int direct_copied = 0;
-    int matched = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
-        ? game_bridge_handle_matches(args, handle) : 0;
+    int slot = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        ? game_bridge_find_slot(args, handle) : -1;
+    int matched = (slot >= 0);
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
         game_bridge_record_call(args, handle, matched);
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
         matched && out &&
-        game_bridge_direct_available(args) &&
         args->pad_size == POORDS4_GAME_BRIDGE_PAD_SIZE) {
-        if (original) {
-            native_result = original(handle, out, 0);
-            native_called = 1;
-            (void)__atomic_fetch_add(
-                &args->native_backing_calls, 1, __ATOMIC_RELAXED);
-            if (native_result < 0)
+        if (args->slots[slot].is_dualsense) {
+            if (original) {
+                native_result = original(handle, out, 0);
+                native_called = 1;
                 (void)__atomic_fetch_add(
-                    &args->native_backing_errors, 1,
-                    __ATOMIC_RELAXED);
-        }
-        __atomic_store_n(
-            &args->last_native_result, native_result, __ATOMIC_RELAXED);
-        if (native_called && native_result == 0)
-            game_bridge_record_native(args, out);
-        int native_connected = native_result == 0 &&
-            game_bridge_native_connected(out);
-        int direct_active = game_bridge_direct_controls_active(args);
-        if (native_connected)
-            (void)__atomic_fetch_add(
-                &args->native_connected_frames, 1, __ATOMIC_RELAXED);
-        (void)__atomic_fetch_add(
-            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
-        if (direct_active)
-            (void)__atomic_fetch_add(
-                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
-        if (game_bridge_copy_direct(
-                args, out, &args->read_state_calls)) {
-            final_result = 0;
-            direct_copied = 1;
-        } else {
-            if (native_connected) {
+                    &args->native_backing_calls, 1, __ATOMIC_RELAXED);
+                if (native_result < 0)
+                    (void)__atomic_fetch_add(
+                        &args->native_backing_errors, 1, __ATOMIC_RELAXED);
+            }
+            __atomic_store_n(
+                &args->last_native_result, native_result, __ATOMIC_RELAXED);
+            if (native_called && native_result == 0) {
+                game_bridge_record_native(args, out);
+                (void)__atomic_fetch_add(
+                    &args->slots[slot].native_passthrough_frames, 1, __ATOMIC_RELAXED);
                 (void)__atomic_fetch_add(
                     &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
                 (void)__atomic_fetch_add(
                     &args->read_state_calls, 1, __ATOMIC_RELAXED);
+                (void)__atomic_fetch_add(
+                    &args->slots[slot].read_state_calls, 1, __ATOMIC_RELAXED);
             }
+            final_result = native_called ? native_result :
+                (original ? original(handle, out, 0) : native_result);
+        } else if (game_bridge_direct_available_slot(args, (unsigned)slot)) {
+            if (original) {
+                native_result = original(handle, out, 0);
+                native_called = 1;
+                (void)__atomic_fetch_add(
+                    &args->native_backing_calls, 1, __ATOMIC_RELAXED);
+                if (native_result < 0)
+                    (void)__atomic_fetch_add(
+                        &args->native_backing_errors, 1,
+                        __ATOMIC_RELAXED);
+            }
+            __atomic_store_n(
+                &args->last_native_result, native_result, __ATOMIC_RELAXED);
+            if (native_called && native_result == 0)
+                game_bridge_record_native(args, out);
+            int native_connected = native_result == 0 &&
+                game_bridge_native_connected(out);
+            int direct_active = game_bridge_direct_controls_active_slot(args, (unsigned)slot);
+            if (native_connected)
+                (void)__atomic_fetch_add(
+                    &args->native_connected_frames, 1, __ATOMIC_RELAXED);
+            (void)__atomic_fetch_add(
+                &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+            if (direct_active)
+                (void)__atomic_fetch_add(
+                    &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
+            if (game_bridge_copy_direct_slot(
+                    args, (unsigned)slot, out, &args->read_state_calls,
+                    &args->slots[slot].read_state_calls)) {
+                final_result = 0;
+                direct_copied = 1;
+            } else {
+                if (native_connected) {
+                    (void)__atomic_fetch_add(
+                        &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                    (void)__atomic_fetch_add(
+                        &args->read_state_calls, 1, __ATOMIC_RELAXED);
+                    (void)__atomic_fetch_add(
+                        &args->slots[slot].native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                }
+                final_result = native_called ? native_result :
+                    (original ? original(handle, out, 0) : native_result);
+            }
+        } else {
             final_result = native_called ? native_result :
                 (original ? original(handle, out, 0) : native_result);
         }
@@ -1219,55 +1360,95 @@ game_pad_read_state_ext_stub(int32_t handle, void *out,
     int32_t native_result = (int32_t)0x80920001u;
     int32_t final_result = 0;
     int direct_copied = 0;
-    int matched = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
-        ? game_bridge_handle_matches(args, handle) : 0;
+    int slot = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        ? game_bridge_find_slot(args, handle) : -1;
+    int matched = (slot >= 0);
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
         game_bridge_record_call(args, handle, matched);
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
         matched && out &&
-        game_bridge_direct_available(args) &&
         args->pad_size == POORDS4_GAME_BRIDGE_PAD_SIZE) {
-        if (original_ext) {
-            native_result = original_ext(handle, out);
-            native_called = 1;
-        } else if (fallback_internal) {
-            native_result = fallback_internal(handle, out, 1);
-            native_called = 1;
-        }
-        if (native_called) {
-            (void)__atomic_fetch_add(
-                &args->native_backing_calls, 1, __ATOMIC_RELAXED);
-            if (native_result < 0)
+        if (args->slots[slot].is_dualsense) {
+            if (original_ext) {
+                native_result = original_ext(handle, out);
+                native_called = 1;
+            } else if (fallback_internal) {
+                native_result = fallback_internal(handle, out, 1);
+                native_called = 1;
+            }
+            if (native_called) {
                 (void)__atomic_fetch_add(
-                    &args->native_backing_errors, 1,
-                    __ATOMIC_RELAXED);
-        }
-        __atomic_store_n(
-            &args->last_native_result, native_result, __ATOMIC_RELAXED);
-        if (native_called && native_result == 0)
-            game_bridge_record_native(args, out);
-        int native_connected = native_result == 0 &&
-            game_bridge_native_connected(out);
-        int direct_active = game_bridge_direct_controls_active(args);
-        if (native_connected)
-            (void)__atomic_fetch_add(
-                &args->native_connected_frames, 1, __ATOMIC_RELAXED);
-        (void)__atomic_fetch_add(
-            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
-        if (direct_active)
-            (void)__atomic_fetch_add(
-                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
-        if (game_bridge_copy_direct(
-                args, out, &args->read_state_ext_calls)) {
-            final_result = 0;
-            direct_copied = 1;
-        } else {
-            if (native_connected) {
+                    &args->native_backing_calls, 1, __ATOMIC_RELAXED);
+                if (native_result < 0)
+                    (void)__atomic_fetch_add(
+                        &args->native_backing_errors, 1, __ATOMIC_RELAXED);
+            }
+            __atomic_store_n(
+                &args->last_native_result, native_result, __ATOMIC_RELAXED);
+            if (native_called && native_result == 0) {
+                game_bridge_record_native(args, out);
+                (void)__atomic_fetch_add(
+                    &args->slots[slot].native_passthrough_frames, 1, __ATOMIC_RELAXED);
                 (void)__atomic_fetch_add(
                     &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
                 (void)__atomic_fetch_add(
                     &args->read_state_ext_calls, 1, __ATOMIC_RELAXED);
+                (void)__atomic_fetch_add(
+                    &args->slots[slot].read_state_ext_calls, 1, __ATOMIC_RELAXED);
             }
+            final_result = native_called ? native_result :
+                (original_ext ? original_ext(handle, out) :
+                 (fallback_internal ? fallback_internal(handle, out, 1) : native_result));
+        } else if (game_bridge_direct_available_slot(args, (unsigned)slot)) {
+            if (original_ext) {
+                native_result = original_ext(handle, out);
+                native_called = 1;
+            } else if (fallback_internal) {
+                native_result = fallback_internal(handle, out, 1);
+                native_called = 1;
+            }
+            if (native_called) {
+                (void)__atomic_fetch_add(
+                    &args->native_backing_calls, 1, __ATOMIC_RELAXED);
+                if (native_result < 0)
+                    (void)__atomic_fetch_add(
+                        &args->native_backing_errors, 1,
+                        __ATOMIC_RELAXED);
+            }
+            __atomic_store_n(
+                &args->last_native_result, native_result, __ATOMIC_RELAXED);
+            if (native_called && native_result == 0)
+                game_bridge_record_native(args, out);
+            int native_connected = native_result == 0 &&
+                game_bridge_native_connected(out);
+            int direct_active = game_bridge_direct_controls_active_slot(args, (unsigned)slot);
+            if (native_connected)
+                (void)__atomic_fetch_add(
+                    &args->native_connected_frames, 1, __ATOMIC_RELAXED);
+            (void)__atomic_fetch_add(
+                &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+            if (direct_active)
+                (void)__atomic_fetch_add(
+                    &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
+            if (game_bridge_copy_direct_slot(
+                    args, (unsigned)slot, out, &args->read_state_ext_calls,
+                    &args->slots[slot].read_state_ext_calls)) {
+                final_result = 0;
+                direct_copied = 1;
+            } else {
+                if (native_connected) {
+                    (void)__atomic_fetch_add(
+                        &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                    (void)__atomic_fetch_add(
+                        &args->read_state_ext_calls, 1, __ATOMIC_RELAXED);
+                    (void)__atomic_fetch_add(
+                        &args->slots[slot].native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                }
+                final_result = native_called ? native_result :
+                    (original_ext ? original_ext(handle, out) :
+                     (fallback_internal ? fallback_internal(handle, out, 1) : native_result));
+            }
+        } else {
             final_result = native_called ? native_result :
                 (original_ext ? original_ext(handle, out) :
                  (fallback_internal ? fallback_internal(handle, out, 1) : native_result));
@@ -1300,62 +1481,99 @@ game_pad_read_stub(int32_t handle, void *out, int32_t num,
     int32_t native_result = (int32_t)0x80920001u;
     int32_t final_result = 0;
     int direct_copied = 0;
-    int matched = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
-        ? game_bridge_handle_matches(args, handle) : 0;
+    int slot = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        ? game_bridge_find_slot(args, handle) : -1;
+    int matched = (slot >= 0);
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
         game_bridge_record_call(args, handle, matched);
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
         matched && out && num > 0 &&
-        game_bridge_direct_available(args) &&
         args->pad_size == POORDS4_GAME_BRIDGE_PAD_SIZE) {
-        if (original) {
-            native_result = original(handle, out, num, 0);
-            native_called = 1;
-            (void)__atomic_fetch_add(
-                &args->native_backing_calls, 1, __ATOMIC_RELAXED);
-            if (native_result < 0)
+        if (args->slots[slot].is_dualsense) {
+            if (original) {
+                native_result = original(handle, out, num, 0);
+                native_called = 1;
                 (void)__atomic_fetch_add(
-                    &args->native_backing_errors, 1,
-                    __ATOMIC_RELAXED);
-        }
-        __atomic_store_n(
-            &args->last_native_result, native_result, __ATOMIC_RELAXED);
-        if (native_called && native_result > 0)
-            game_bridge_record_native(args, out);
-        int native_connected = native_result > 0 &&
-            game_bridge_native_connected(out);
-        int direct_active = game_bridge_direct_controls_active(args);
-        if (native_connected)
-            (void)__atomic_fetch_add(
-                &args->native_connected_frames, 1, __ATOMIC_RELAXED);
-        (void)__atomic_fetch_add(
-            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
-        if (direct_active)
-            (void)__atomic_fetch_add(
-                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
-        volatile uint32_t *read_seq_table =
-            (volatile uint32_t *)(void *)args->legacy_pad_data;
-        uint32_t slot = (uint32_t)(handle & 7u);
-        uint32_t current_seq = __atomic_load_n(
-            &args->direct_seq, __ATOMIC_ACQUIRE);
-        if (current_seq == 0 || current_seq == read_seq_table[slot]) {
-            final_result = 0;
-        } else {
-            if (game_bridge_copy_direct(
-                    args, out, &args->read_calls)) {
-                read_seq_table[slot] = current_seq;
-                final_result = 1;
-                direct_copied = 1;
-            } else {
-                if (native_connected) {
+                    &args->native_backing_calls, 1, __ATOMIC_RELAXED);
+                if (native_result < 0)
                     (void)__atomic_fetch_add(
-                        &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
-                    (void)__atomic_fetch_add(
-                        &args->read_calls, 1, __ATOMIC_RELAXED);
-                }
-                final_result = native_called ? native_result :
-                    (original ? original(handle, out, num, 0) : native_result);
+                        &args->native_backing_errors, 1, __ATOMIC_RELAXED);
             }
+            __atomic_store_n(
+                &args->last_native_result, native_result, __ATOMIC_RELAXED);
+            if (native_called && native_result > 0) {
+                game_bridge_record_native(args, out);
+                (void)__atomic_fetch_add(
+                    &args->slots[slot].native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                (void)__atomic_fetch_add(
+                    &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                (void)__atomic_fetch_add(
+                    &args->read_calls, 1, __ATOMIC_RELAXED);
+                (void)__atomic_fetch_add(
+                    &args->slots[slot].read_calls, 1, __ATOMIC_RELAXED);
+            }
+            final_result = native_called ? native_result :
+                (original ? original(handle, out, num, 0) : native_result);
+        } else if (game_bridge_direct_available_slot(args, (unsigned)slot)) {
+            if (original) {
+                native_result = original(handle, out, num, 0);
+                native_called = 1;
+                (void)__atomic_fetch_add(
+                    &args->native_backing_calls, 1, __ATOMIC_RELAXED);
+                if (native_result < 0)
+                    (void)__atomic_fetch_add(
+                        &args->native_backing_errors, 1,
+                        __ATOMIC_RELAXED);
+            }
+            __atomic_store_n(
+                &args->last_native_result, native_result, __ATOMIC_RELAXED);
+            if (native_called && native_result > 0)
+                game_bridge_record_native(args, out);
+            int native_connected = native_result > 0 &&
+                game_bridge_native_connected(out);
+            int direct_active = game_bridge_direct_controls_active_slot(args, (unsigned)slot);
+            if (native_connected)
+                (void)__atomic_fetch_add(
+                    &args->native_connected_frames, 1, __ATOMIC_RELAXED);
+            (void)__atomic_fetch_add(
+                &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+            if (direct_active)
+                (void)__atomic_fetch_add(
+                    &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
+            volatile uint32_t *read_seq_table =
+                (volatile uint32_t *)(void *)args->legacy_pad_data;
+            uint32_t current_seq = (slot == 0 && args->slots[0].direct_packets == 0)
+                ? __atomic_load_n(&args->direct_seq, __ATOMIC_ACQUIRE)
+                : __atomic_load_n(&args->slots[slot].direct_seq, __ATOMIC_ACQUIRE);
+            uint32_t last_seq = (slot == 0 && args->slots[0].direct_packets == 0)
+                ? read_seq_table[handle & 7u]
+                : args->slots[slot].last_read_seq;
+            if (current_seq == 0 || current_seq == last_seq) {
+                final_result = 0;
+            } else {
+                if (game_bridge_copy_direct_slot(
+                        args, (unsigned)slot, out, &args->read_calls,
+                        &args->slots[slot].read_calls)) {
+                    read_seq_table[handle & 7u] = current_seq;
+                    args->slots[slot].last_read_seq = current_seq;
+                    final_result = 1;
+                    direct_copied = 1;
+                } else {
+                    if (native_connected) {
+                        (void)__atomic_fetch_add(
+                            &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                        (void)__atomic_fetch_add(
+                            &args->read_calls, 1, __ATOMIC_RELAXED);
+                        (void)__atomic_fetch_add(
+                            &args->slots[slot].native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                    }
+                    final_result = native_called ? native_result :
+                        (original ? original(handle, out, num, 0) : native_result);
+                }
+            }
+        } else {
+            final_result = native_called ? native_result :
+                (original ? original(handle, out, num, 0) : native_result);
         }
     } else {
         final_result = native_called ? native_result :
@@ -1401,68 +1619,112 @@ game_pad_read_ext_stub(int32_t handle, void *out, int32_t num,
     int32_t native_result = (int32_t)0x80920001u;
     int32_t final_result = 0;
     int direct_copied = 0;
-    int matched = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
-        ? game_bridge_handle_matches(args, handle) : 0;
+    int slot = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        ? game_bridge_find_slot(args, handle) : -1;
+    int matched = (slot >= 0);
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
         game_bridge_record_call(args, handle, matched);
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
         matched && out && num > 0 &&
-        game_bridge_direct_available(args) &&
         args->pad_size == POORDS4_GAME_BRIDGE_PAD_SIZE) {
-        if (original_ext) {
-            native_result = original_ext(handle, out, num);
-            native_called = 1;
-        } else if (fallback_internal) {
-            native_result = fallback_internal(handle, out, num, 1);
-            native_called = 1;
-        }
-        if (native_called) {
-            (void)__atomic_fetch_add(
-                &args->native_backing_calls, 1, __ATOMIC_RELAXED);
-            if (native_result < 0)
-                (void)__atomic_fetch_add(
-                    &args->native_backing_errors, 1,
-                    __ATOMIC_RELAXED);
-        }
-        __atomic_store_n(
-            &args->last_native_result, native_result, __ATOMIC_RELAXED);
-        if (native_called && native_result > 0)
-            game_bridge_record_native(args, out);
-        int native_connected = native_result > 0 &&
-            game_bridge_native_connected(out);
-        int direct_active = game_bridge_direct_controls_active(args);
-        if (native_connected)
-            (void)__atomic_fetch_add(
-                &args->native_connected_frames, 1, __ATOMIC_RELAXED);
-        (void)__atomic_fetch_add(
-            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
-        if (direct_active)
-            (void)__atomic_fetch_add(
-                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
-        volatile uint32_t *read_ext_seq_table =
-            (volatile uint32_t *)(void *)(args->legacy_pad_data + 32);
-        uint32_t slot = (uint32_t)(handle & 7u);
-        uint32_t current_seq = __atomic_load_n(
-            &args->direct_seq, __ATOMIC_ACQUIRE);
-        if (current_seq == 0 || current_seq == read_ext_seq_table[slot]) {
-            final_result = 0;
-        } else {
-            if (game_bridge_copy_direct(
-                    args, out, &args->read_ext_calls)) {
-                read_ext_seq_table[slot] = current_seq;
-                final_result = 1;
-                direct_copied = 1;
-            } else {
-                if (native_connected) {
-                    (void)__atomic_fetch_add(
-                        &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
-                    (void)__atomic_fetch_add(
-                        &args->read_ext_calls, 1, __ATOMIC_RELAXED);
-                }
-                final_result = native_called ? native_result :
-                    (original_ext ? original_ext(handle, out, num) :
-                     (fallback_internal ? fallback_internal(handle, out, num, 1) : native_result));
+        if (args->slots[slot].is_dualsense) {
+            if (original_ext) {
+                native_result = original_ext(handle, out, num);
+                native_called = 1;
+            } else if (fallback_internal) {
+                native_result = fallback_internal(handle, out, num, 1);
+                native_called = 1;
             }
+            if (native_called) {
+                (void)__atomic_fetch_add(
+                    &args->native_backing_calls, 1, __ATOMIC_RELAXED);
+                if (native_result < 0)
+                    (void)__atomic_fetch_add(
+                        &args->native_backing_errors, 1, __ATOMIC_RELAXED);
+            }
+            __atomic_store_n(
+                &args->last_native_result, native_result, __ATOMIC_RELAXED);
+            if (native_called && native_result > 0) {
+                game_bridge_record_native(args, out);
+                (void)__atomic_fetch_add(
+                    &args->slots[slot].native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                (void)__atomic_fetch_add(
+                    &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                (void)__atomic_fetch_add(
+                    &args->read_ext_calls, 1, __ATOMIC_RELAXED);
+                (void)__atomic_fetch_add(
+                    &args->slots[slot].read_ext_calls, 1, __ATOMIC_RELAXED);
+            }
+            final_result = native_called ? native_result :
+                (original_ext ? original_ext(handle, out, num) :
+                 (fallback_internal ? fallback_internal(handle, out, num, 1) : native_result));
+        } else if (game_bridge_direct_available_slot(args, (unsigned)slot)) {
+            if (original_ext) {
+                native_result = original_ext(handle, out, num);
+                native_called = 1;
+            } else if (fallback_internal) {
+                native_result = fallback_internal(handle, out, num, 1);
+                native_called = 1;
+            }
+            if (native_called) {
+                (void)__atomic_fetch_add(
+                    &args->native_backing_calls, 1, __ATOMIC_RELAXED);
+                if (native_result < 0)
+                    (void)__atomic_fetch_add(
+                        &args->native_backing_errors, 1,
+                        __ATOMIC_RELAXED);
+            }
+            __atomic_store_n(
+                &args->last_native_result, native_result, __ATOMIC_RELAXED);
+            if (native_called && native_result > 0)
+                game_bridge_record_native(args, out);
+            int native_connected = native_result > 0 &&
+                game_bridge_native_connected(out);
+            int direct_active = game_bridge_direct_controls_active_slot(args, (unsigned)slot);
+            if (native_connected)
+                (void)__atomic_fetch_add(
+                    &args->native_connected_frames, 1, __ATOMIC_RELAXED);
+            (void)__atomic_fetch_add(
+                &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+            if (direct_active)
+                (void)__atomic_fetch_add(
+                    &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
+            volatile uint32_t *read_ext_seq_table =
+                (volatile uint32_t *)(void *)(args->legacy_pad_data + 32);
+            uint32_t current_seq = (slot == 0 && args->slots[0].direct_packets == 0)
+                ? __atomic_load_n(&args->direct_seq, __ATOMIC_ACQUIRE)
+                : __atomic_load_n(&args->slots[slot].direct_seq, __ATOMIC_ACQUIRE);
+            uint32_t last_seq = (slot == 0 && args->slots[0].direct_packets == 0)
+                ? read_ext_seq_table[handle & 7u]
+                : args->slots[slot].last_read_seq;
+            if (current_seq == 0 || current_seq == last_seq) {
+                final_result = 0;
+            } else {
+                if (game_bridge_copy_direct_slot(
+                        args, (unsigned)slot, out, &args->read_ext_calls,
+                        &args->slots[slot].read_ext_calls)) {
+                    read_ext_seq_table[handle & 7u] = current_seq;
+                    args->slots[slot].last_read_seq = current_seq;
+                    final_result = 1;
+                    direct_copied = 1;
+                } else {
+                    if (native_connected) {
+                        (void)__atomic_fetch_add(
+                            &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                        (void)__atomic_fetch_add(
+                            &args->read_ext_calls, 1, __ATOMIC_RELAXED);
+                        (void)__atomic_fetch_add(
+                            &args->slots[slot].native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                    }
+                    final_result = native_called ? native_result :
+                        (original_ext ? original_ext(handle, out, num) :
+                         (fallback_internal ? fallback_internal(handle, out, num, 1) : native_result));
+                }
+            }
+        } else {
+            final_result = native_called ? native_result :
+                (original_ext ? original_ext(handle, out, num) :
+                 (fallback_internal ? fallback_internal(handle, out, num, 1) : native_result));
         }
     } else {
         final_result = native_called ? native_result :
@@ -1505,50 +1767,83 @@ game_pad_get_data_internal_stub(int32_t handle, void *out,
     int32_t native_result = (int32_t)0x80920001u;
     int32_t final_result = 0;
     int direct_copied = 0;
-    int matched = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
-        ? game_bridge_handle_matches(args, handle) : 0;
+    int slot = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        ? game_bridge_find_slot(args, handle) : -1;
+    int matched = (slot >= 0);
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
         game_bridge_record_call(args, handle, matched);
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
         matched && out &&
-        game_bridge_direct_available(args) &&
         args->pad_size == POORDS4_GAME_BRIDGE_PAD_SIZE) {
-        if (original) {
-            native_result = original(handle, out, 1);
-            native_called = 1;
-            (void)__atomic_fetch_add(
-                &args->native_backing_calls, 1, __ATOMIC_RELAXED);
-            if (native_result < 0)
+        if (args->slots[slot].is_dualsense) {
+            if (original) {
+                native_result = original(handle, out, 1);
+                native_called = 1;
                 (void)__atomic_fetch_add(
-                    &args->native_backing_errors, 1,
-                    __ATOMIC_RELAXED);
-        }
-        __atomic_store_n(
-            &args->last_native_result, native_result, __ATOMIC_RELAXED);
-        if (native_called && native_result == 0)
-            game_bridge_record_native(args, out);
-        int native_connected = native_result == 0 &&
-            game_bridge_native_connected(out);
-        int direct_active = game_bridge_direct_controls_active(args);
-        if (native_connected)
-            (void)__atomic_fetch_add(
-                &args->native_connected_frames, 1, __ATOMIC_RELAXED);
-        (void)__atomic_fetch_add(
-            &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
-        if (direct_active)
-            (void)__atomic_fetch_add(
-                &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
-        if (game_bridge_copy_direct(
-                args, out, &args->data_internal_calls)) {
-            final_result = 0;
-            direct_copied = 1;
-        } else {
-            if (native_connected) {
+                    &args->native_backing_calls, 1, __ATOMIC_RELAXED);
+                if (native_result < 0)
+                    (void)__atomic_fetch_add(
+                        &args->native_backing_errors, 1, __ATOMIC_RELAXED);
+            }
+            __atomic_store_n(
+                &args->last_native_result, native_result, __ATOMIC_RELAXED);
+            if (native_called && native_result == 0) {
+                game_bridge_record_native(args, out);
+                (void)__atomic_fetch_add(
+                    &args->slots[slot].native_passthrough_frames, 1, __ATOMIC_RELAXED);
                 (void)__atomic_fetch_add(
                     &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
                 (void)__atomic_fetch_add(
                     &args->data_internal_calls, 1, __ATOMIC_RELAXED);
+                (void)__atomic_fetch_add(
+                    &args->slots[slot].data_internal_calls, 1, __ATOMIC_RELAXED);
             }
+            final_result = native_called ? native_result :
+                (original ? original(handle, out, 1) : native_result);
+        } else if (game_bridge_direct_available_slot(args, (unsigned)slot)) {
+            if (original) {
+                native_result = original(handle, out, 1);
+                native_called = 1;
+                (void)__atomic_fetch_add(
+                    &args->native_backing_calls, 1, __ATOMIC_RELAXED);
+                if (native_result < 0)
+                    (void)__atomic_fetch_add(
+                        &args->native_backing_errors, 1,
+                        __ATOMIC_RELAXED);
+            }
+            __atomic_store_n(
+                &args->last_native_result, native_result, __ATOMIC_RELAXED);
+            if (native_called && native_result == 0)
+                game_bridge_record_native(args, out);
+            int native_connected = native_result == 0 &&
+                game_bridge_native_connected(out);
+            int direct_active = game_bridge_direct_controls_active_slot(args, (unsigned)slot);
+            if (native_connected)
+                (void)__atomic_fetch_add(
+                    &args->native_connected_frames, 1, __ATOMIC_RELAXED);
+            (void)__atomic_fetch_add(
+                &args->direct_fallback_frames, 1, __ATOMIC_RELAXED);
+            if (direct_active)
+                (void)__atomic_fetch_add(
+                    &args->direct_active_fallbacks, 1, __ATOMIC_RELAXED);
+            if (game_bridge_copy_direct_slot(
+                    args, (unsigned)slot, out, &args->data_internal_calls,
+                    &args->slots[slot].data_internal_calls)) {
+                final_result = 0;
+                direct_copied = 1;
+            } else {
+                if (native_connected) {
+                    (void)__atomic_fetch_add(
+                        &args->native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                    (void)__atomic_fetch_add(
+                        &args->data_internal_calls, 1, __ATOMIC_RELAXED);
+                    (void)__atomic_fetch_add(
+                        &args->slots[slot].native_passthrough_frames, 1, __ATOMIC_RELAXED);
+                }
+                final_result = native_called ? native_result :
+                    (original ? original(handle, out, 1) : native_result);
+            }
+        } else {
             final_result = native_called ? native_result :
                 (original ? original(handle, out, 1) : native_result);
         }
@@ -1594,8 +1889,9 @@ game_pad_get_controller_info_stub(int32_t handle, void *out,
         args ? args->fp_get_controller_info_trampoline : 0);
     int32_t result = original
         ? original(handle, out) : (int32_t)0x80920001u;
-    int matched = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
-        ? game_bridge_handle_matches(args, handle) : 0;
+    int slot = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        ? game_bridge_find_slot(args, handle) : -1;
+    int matched = (slot >= 0);
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
         game_bridge_record_call(args, handle, matched);
     if (args)
@@ -1604,7 +1900,8 @@ game_pad_get_controller_info_stub(int32_t handle, void *out,
     if (args &&
         args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
         matched && out &&
-        game_bridge_direct_available(args)) {
+        !args->slots[slot].is_dualsense &&
+        game_bridge_direct_available_slot(args, (unsigned)slot)) {
         volatile uint8_t *info = (volatile uint8_t *)out;
         uint16_t touch_x = (uint16_t)info[4] |
             ((uint16_t)info[5] << 8u);
@@ -1665,8 +1962,9 @@ game_pad_get_ext_controller_info_stub(int32_t handle, void *out,
         args ? args->fp_get_ext_controller_info_trampoline : 0);
     int32_t result = original
         ? original(handle, out) : (int32_t)0x80920001u;
-    int matched = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
-        ? game_bridge_handle_matches(args, handle) : 0;
+    int slot = (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
+        ? game_bridge_find_slot(args, handle) : -1;
+    int matched = (slot >= 0);
     if (args && args->magic == POORDS4_GAME_BRIDGE_MAGIC)
         game_bridge_record_call(args, handle, matched);
     if (args)
@@ -1675,7 +1973,8 @@ game_pad_get_ext_controller_info_stub(int32_t handle, void *out,
     if (args &&
         args->magic == POORDS4_GAME_BRIDGE_MAGIC &&
         matched && out &&
-        game_bridge_direct_available(args)) {
+        !args->slots[slot].is_dualsense &&
+        game_bridge_direct_available_slot(args, (unsigned)slot)) {
         volatile uint8_t *info = (volatile uint8_t *)out;
         uint16_t touch_x = (uint16_t)info[4] |
             ((uint16_t)info[5] << 8u);
@@ -4188,7 +4487,8 @@ static int
 game_bridge_select_pad_handle(
     pid_t target, intptr_t libpad_base, intptr_t read_state,
     int32_t source_user_id, int32_t source_pad_index, int report_fd,
-    int32_t *out_handle, int32_t *out_index)
+    int32_t *out_handle, int32_t *out_index,
+    int32_t *out_slot_handles, uint32_t *out_slot_dualsense)
 {
     if (target <= 0 || libpad_base <= 0 || read_state <= 0 ||
         source_user_id < 0 || source_pad_index < 0 ||
@@ -4198,6 +4498,13 @@ game_bridge_select_pad_handle(
 
     *out_handle = -1;
     *out_index = -1;
+    if (out_slot_handles) {
+        for (unsigned s = 0; s < POORDS4_MAX_SLOTS; ++s) {
+            out_slot_handles[s] = -1;
+            if (out_slot_dualsense)
+                out_slot_dualsense[s] = 0;
+        }
+    }
     GameBridgeDynlibObjectPrefix object;
     memset(&object, 0, sizeof(object));
     intptr_t table = 0;
@@ -4331,6 +4638,14 @@ game_bridge_select_pad_handle(
             slot, (unsigned long)entry, (uint32_t)handle,
             (uint32_t)user_id,
             inferred_index, connected, valid, vendor, product, is_ds4);
+
+        if (out_slot_handles && inferred_index >= 0 && inferred_index < (int32_t)POORDS4_MAX_SLOTS) {
+            if (out_slot_handles[inferred_index] <= 0 || is_active_dualsense) {
+                out_slot_handles[inferred_index] = handle;
+                if (out_slot_dualsense)
+                    out_slot_dualsense[inferred_index] = is_active_dualsense ? 1u : 0u;
+            }
+        }
 
         active_count++;
         sole_handle = handle;
@@ -4831,10 +5146,13 @@ wireless_ds4_game_bridge_run_passive(
 
     int32_t game_pad_handle = -1;
     int32_t game_pad_index = -1;
+    int32_t slot_handles[POORDS4_MAX_SLOTS] = {-1, -1, -1, -1};
+    uint32_t slot_dualsense[POORDS4_MAX_SLOTS] = {0, 0, 0, 0};
     if (game_bridge_select_pad_handle(
             target, base, originals[0], source->user_id,
             source->pad_index,
-            report_fd, &game_pad_handle, &game_pad_index) != 0) {
+            report_fd, &game_pad_handle, &game_pad_index,
+            slot_handles, slot_dualsense) != 0) {
         report_printf(report_fd, "state=waiting_for_game_pad_handle\n");
         result = -4;
         goto done;
@@ -4959,6 +5277,20 @@ wireless_ds4_game_bridge_run_passive(
         args.observed_handles[i] = -1;
         args.observed_handle_calls[i] = 0;
     }
+    for (unsigned i = 0; i < POORDS4_MAX_SLOTS; ++i) {
+        args.slots[i].pad_handle = slot_handles[i];
+        args.slots[i].pad_index = (int32_t)i;
+        args.slots[i].active = 0;
+        args.slots[i].is_dualsense = slot_dualsense[i];
+        args.slots[i].is_simulated = 0;
+        args.slots[i].direct_seq = 0;
+        args.slots[i].direct_lease = 0;
+        args.slots[i].direct_packets = 0;
+        args.slots[i].last_read_seq = 0;
+    }
+    args.slots[0].pad_handle = game_pad_handle;
+    args.slots[0].pad_index = (int32_t)game_pad_index;
+    args.slots[0].is_dualsense = 0;
     args.fp_state_internal = originals[0];
     args.fp_read_internal = originals[2];
     args.fp_data_internal = originals[4];
@@ -5206,16 +5538,19 @@ wireless_ds4_game_bridge_quiesce(pid_t game_pid, intptr_t args_kaddr)
 }
 
 int
-wireless_ds4_game_bridge_update(pid_t game_pid, intptr_t args_kaddr,
-                               const void *pad_data,
-                               uint32_t pad_data_len)
+wireless_ds4_game_bridge_update_slot(pid_t game_pid, intptr_t args_kaddr,
+                                     unsigned slot_idx, const void *pad_data,
+                                     uint32_t pad_data_len, int is_simulated,
+                                     int is_dualsense)
 {
 #if !defined(__PROSPERO__)
-    (void)game_pid; (void)args_kaddr; (void)pad_data; (void)pad_data_len;
+    (void)game_pid; (void)args_kaddr; (void)slot_idx; (void)pad_data;
+    (void)pad_data_len; (void)is_simulated; (void)is_dualsense;
     return -1;
 #else
     if (game_pid <= 0 || !args_kaddr || !pad_data ||
-        pad_data_len < POORDS4_GAME_BRIDGE_PAD_SIZE)
+        pad_data_len < POORDS4_GAME_BRIDGE_PAD_SIZE ||
+        slot_idx >= POORDS4_MAX_SLOTS)
         return -1;
     if (game_pid != g_game_bridge_direct_pid ||
         args_kaddr != g_game_bridge_direct_args) {
@@ -5223,45 +5558,94 @@ wireless_ds4_game_bridge_update(pid_t game_pid, intptr_t args_kaddr,
         g_game_bridge_direct_args = args_kaddr;
         g_game_bridge_direct_seq = 0;
         g_game_bridge_direct_packets = 0;
+        for (unsigned s = 0; s < POORDS4_MAX_SLOTS; ++s) {
+            g_game_bridge_slot_seq[s] = 0;
+            g_game_bridge_slot_packets[s] = 0;
+        }
         g_game_bridge_direct_cr3 = 0;
         g_game_bridge_direct_dmap = 0;
     }
-    uint32_t next_seq = g_game_bridge_direct_seq + 1u;
+    uint32_t next_seq = g_game_bridge_slot_seq[slot_idx] + 1u;
     if (next_seq == 0)
         next_seq = 1;
-    uint32_t slot = next_seq & 1u;
-    intptr_t frame_address = args_kaddr + (intptr_t)offsetof(
-        GamePadBridgeArgs, direct_pad_data) +
-        (intptr_t)slot * POORDS4_GAME_BRIDGE_PAD_SIZE;
+    uint32_t buffer_idx = next_seq & 1u;
+
+    intptr_t slot_base = args_kaddr + (intptr_t)offsetof(GamePadBridgeArgs, slots) +
+        (intptr_t)slot_idx * (intptr_t)sizeof(GamePadBridgeSlot);
+    intptr_t frame_address = slot_base +
+        (intptr_t)offsetof(GamePadBridgeSlot, direct_pad_data) +
+        (intptr_t)buffer_idx * POORDS4_GAME_BRIDGE_PAD_SIZE;
+
     if (game_bridge_process_write(
             game_pid, frame_address, pad_data,
             POORDS4_GAME_BRIDGE_PAD_SIZE) != 0)
         return -1;
+
     struct {
-        uint32_t seq;
-        uint32_t lease;
         uint32_t active;
-        uint32_t packets;
-    } publication;
-    publication.seq = next_seq;
-    publication.lease = POORDS4_GAME_BRIDGE_DIRECT_LEASE;
-    publication.active = 1;
-    publication.packets = g_game_bridge_direct_packets + 1u;
+        uint32_t is_dualsense;
+        uint32_t is_simulated;
+        uint32_t direct_seq;
+        uint32_t direct_lease;
+        uint32_t direct_packets;
+    } slot_pub;
+    slot_pub.active = 1u;
+    slot_pub.is_dualsense = (uint32_t)(is_dualsense ? 1 : 0);
+    slot_pub.is_simulated = (uint32_t)(is_simulated ? 1 : 0);
+    slot_pub.direct_seq = next_seq;
+    slot_pub.direct_lease = POORDS4_GAME_BRIDGE_DIRECT_LEASE;
+    slot_pub.direct_packets = g_game_bridge_slot_packets[slot_idx] + 1u;
+
     if (game_bridge_process_write(
+            game_pid,
+            slot_base + (intptr_t)offsetof(GamePadBridgeSlot, active),
+            &slot_pub, sizeof(slot_pub)) != 0)
+        return -1;
+
+    g_game_bridge_slot_seq[slot_idx] = next_seq;
+    g_game_bridge_slot_packets[slot_idx] = slot_pub.direct_packets;
+
+    if (slot_idx == 0) {
+        intptr_t legacy_frame = args_kaddr +
+            (intptr_t)offsetof(GamePadBridgeArgs, direct_pad_data) +
+            (intptr_t)buffer_idx * POORDS4_GAME_BRIDGE_PAD_SIZE;
+        (void)game_bridge_process_write(
+            game_pid, legacy_frame, pad_data,
+            POORDS4_GAME_BRIDGE_PAD_SIZE);
+        struct {
+            uint32_t seq;
+            uint32_t lease;
+            uint32_t active;
+            uint32_t packets;
+        } publication;
+        publication.seq = next_seq;
+        publication.lease = POORDS4_GAME_BRIDGE_DIRECT_LEASE;
+        publication.active = 1;
+        publication.packets = slot_pub.direct_packets;
+        (void)game_bridge_process_write(
             game_pid,
             args_kaddr + (intptr_t)offsetof(
                 GamePadBridgeArgs, direct_seq), &publication,
-            sizeof(publication)) != 0)
-        return -1;
-    g_game_bridge_direct_seq = next_seq;
-    g_game_bridge_direct_packets = publication.packets;
+            sizeof(publication));
+        g_game_bridge_direct_seq = next_seq;
+        g_game_bridge_direct_packets = publication.packets;
+    }
     return 0;
 #endif
 }
 
 int
+wireless_ds4_game_bridge_update(pid_t game_pid, intptr_t args_kaddr,
+                                const void *pad_data,
+                                uint32_t pad_data_len)
+{
+    return wireless_ds4_game_bridge_update_slot(
+        game_pid, args_kaddr, 0, pad_data, pad_data_len, 0, 0);
+}
+
+int
 wireless_ds4_game_bridge_status(pid_t game_pid, intptr_t args_kaddr,
-                               PoorDS4GameBridgeStatus *out_status)
+                                PoorDS4GameBridgeStatus *out_status)
 {
 #if !defined(__PROSPERO__)
     (void)game_pid; (void)args_kaddr; (void)out_status;
@@ -5359,6 +5743,29 @@ wireless_ds4_game_bridge_status(pid_t game_pid, intptr_t args_kaddr,
     out_status->event_ring_head = args.event_ring_head;
     memcpy(out_status->event_ring, (const void *)args.event_ring,
            sizeof(out_status->event_ring));
+    for (unsigned s = 0; s < POORDS4_MAX_SLOTS; ++s) {
+        out_status->slots[s].pad_handle = args.slots[s].pad_handle;
+        out_status->slots[s].pad_index = args.slots[s].pad_index;
+        out_status->slots[s].active = args.slots[s].active;
+        out_status->slots[s].is_dualsense = args.slots[s].is_dualsense;
+        out_status->slots[s].is_simulated = args.slots[s].is_simulated;
+        out_status->slots[s].seq = args.slots[s].direct_seq;
+        out_status->slots[s].packets = args.slots[s].direct_packets;
+        out_status->slots[s].read_state_calls = args.slots[s].read_state_calls;
+        out_status->slots[s].read_calls = args.slots[s].read_calls;
+        out_status->slots[s].direct_fallback_frames = args.slots[s].direct_fallback_frames;
+        out_status->slots[s].native_passthrough_frames = args.slots[s].native_passthrough_frames;
+        ScePadData slot_pad;
+        memcpy(&slot_pad, args.slots[s].direct_pad_data[args.slots[s].direct_seq & 1u], sizeof(slot_pad));
+        out_status->slots[s].buttons = slot_pad.buttons;
+        out_status->slots[s].lx = slot_pad.leftStick.x;
+        out_status->slots[s].ly = slot_pad.leftStick.y;
+        out_status->slots[s].rx = slot_pad.rightStick.x;
+        out_status->slots[s].ry = slot_pad.rightStick.y;
+        out_status->slots[s].l2 = slot_pad.analogButtons.l2;
+        out_status->slots[s].r2 = slot_pad.analogButtons.r2;
+        out_status->slots[s].connected = slot_pad.connected;
+    }
     return 0;
 #endif
 }
