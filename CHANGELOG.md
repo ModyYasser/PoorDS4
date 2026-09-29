@@ -3,6 +3,35 @@
 All notable changes to this project are documented here. Release tags follow
 Semantic Versioning; wireless-bridge candidates use `0.1.0-rcN`.
 
+## [0.1.0-rc51] - 2026-09-29
+
+### Added
+
+- **Concurrent Multi-DS4 Controller Streaming (Slots 0..3)**:
+  - Injected `SceRemotePlay` reader thread polls up to 4 active physical DS4 controller handles concurrently at up to 1000Hz via `RemotePadReaderArgs.slot_handles[4]`, writing pad packets into per-slot buffers and closing all opened handles on thread exit.
+  - Implemented `wireless_ds4_remote_reader_read_slot` in `wireless_ds4.c` for per-slot retrieval of physical DS4 state and atomic sequence counters.
+  - Extended `feed_multi_controller_slots` in `game_pad_bridge_main.c` to feed physical secondary controllers, simulated pads, and same-user aliases, supporting any combination of physical DS4, simulated DS4, and native DualSense controllers.
+  - Updated `game_pad_bridge_status_main.c` to display `Player %u (Physical DS4)` for secondary physical controllers.
+
+### Fixed
+
+- **Unreal Engine 5 Ghost Handle Mismatch Filtering**:
+  - Filtered invalid handles (`handle <= 0 || (handle & 0xffffff00) == 0 || (handle & 0x80000000) != 0`) in `game_bridge_record_call`, preventing false mismatch telemetry when UE5 titles poll unassigned player slots or error codes (`0x80920004`).
+- **Autonomous Stale Bridge Auto-Healing & DMAP Rollback**:
+  - Automatically restores orphaned gateways in `game_bridge_recover_stale_v1` back to Sony `libScePad` pointers using direct physical DMAP writes (`game_bridge_process_write`) if an orphaned or corrupted gateway is detected, eliminating `stale_recovery_error=foreign_import` stalls.
+  - Added fallback direct physical write in `wireless_ds4_game_bridge_run_passive` `rollback:` to guarantee all modified GOT slots are restored even if user-space COW write fails.
+
+## [0.1.0-rc50] - 2026-09-29
+
+### Fixed
+
+- **Forza Horizon 5 & Multi-Module Same-User Handle Aliasing**:
+  - Resolved physical DS4 inputs being ignored in titles with modular steering wheel/periperhal PRXs (e.g. Forza Horizon 5's `/app0/logiWheel.prx`). In such games, the peripheral PRX opens handle 0 (`0x03a40700`) before the game engine opens handle 1 (`0x03180701`) under the same user ID. Previously, only handle 0 received the DS4 packet stream while handle 1 (the actual game engine) received Sony mismatch errors (`0x80920001`).
+  - Added user ID matching tracking (`out_slot_user_matches`) during libScePad client table scanning in `game_bridge_select_pad_handle`.
+  - Populated all discovered open game handles into `args.slots[i].pad_handle` along with `user_matches` metadata in `reserved[0]`.
+  - Updated `feed_multi_controller_slots` in `game_pad_bridge_main.c` to mirror primary DS4 input frames to all active non-DualSense handles belonging to the same user when not overridden by simulation, feeding both `logiWheel.prx` and `eboot.bin` simultaneously.
+  - Updated `game_pad_bridge_status_main.c` and slot telemetry reporting to distinguish same-user alias slots (`Player %u Alias (Primary DS4)`).
+
 ## [0.1.0-rc49] - 2026-09-28
 
 ### Fixed

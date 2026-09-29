@@ -986,10 +986,14 @@ refresh_simulated_pads_config(void)
 }
 
 static void
-feed_multi_controller_slots(pid_t game_pid, intptr_t bridge_args,
-                            uint64_t input_frames, unsigned primary_slot)
+feed_multi_controller_slots(pid_t reader_pid, intptr_t reader_args,
+                            pid_t game_pid, intptr_t bridge_args,
+                            uint64_t input_frames, unsigned primary_slot,
+                            const PoorDS4GameBridgeStatus *bridge_status,
+                            const ScePadData *primary_pad)
 {
-    static int s_prev_sim_mask = 0;
+    static int s_prev_fed_mask = 0;
+    int current_fed_mask = 0;
     refresh_simulated_pads_config();
 
     uint64_t now_ms = monotonic_milliseconds();
@@ -997,6 +1001,7 @@ feed_multi_controller_slots(pid_t game_pid, intptr_t bridge_args,
         if (s == primary_slot)
             continue;
         if (g_sim_mask & (1 << s)) {
+            current_fed_mask |= (1 << s);
             ScePadData sim_pad;
             memset(&sim_pad, 0, sizeof(sim_pad));
             sim_pad.buttons = g_sim_buttons[s];
@@ -1013,11 +1018,31 @@ feed_multi_controller_slots(pid_t game_pid, intptr_t bridge_args,
             (void)wireless_ds4_game_bridge_update_slot(
                 game_pid, bridge_args, s, &sim_pad, sizeof(sim_pad),
                 1 /* is_simulated */, 0 /* is_dualsense */);
-        } else if (s_prev_sim_mask & (1 << s)) {
-            (void)wireless_ds4_game_bridge_deactivate_slot(game_pid, bridge_args, s);
+        } else {
+            ScePadData physical_pad;
+            uint32_t slot_seq = 0;
+            if (reader_pid > 0 && reader_args > 0 &&
+                wireless_ds4_remote_reader_read_slot(
+                    reader_pid, reader_args, s,
+                    &physical_pad, sizeof(physical_pad), &slot_seq) == 0 &&
+                physical_pad.connected != 0) {
+                current_fed_mask |= (1 << s);
+                (void)wireless_ds4_game_bridge_update_slot(
+                    game_pid, bridge_args, s, &physical_pad, sizeof(physical_pad),
+                    0 /* is_simulated */, 0 /* is_dualsense */);
+            } else if (bridge_status && bridge_status->slots[s].pad_handle > 0 &&
+                       bridge_status->slots[s].user_matches &&
+                       !bridge_status->slots[s].is_dualsense && primary_pad) {
+                current_fed_mask |= (1 << s);
+                (void)wireless_ds4_game_bridge_update_slot(
+                    game_pid, bridge_args, s, primary_pad, sizeof(*primary_pad),
+                    0 /* is_simulated */, 0 /* is_dualsense */);
+            } else if (s_prev_fed_mask & (1 << s)) {
+                (void)wireless_ds4_game_bridge_deactivate_slot(game_pid, bridge_args, s);
+            }
         }
     }
-    s_prev_sim_mask = g_sim_mask;
+    s_prev_fed_mask = current_fed_mask;
 }
 
 static unsigned
@@ -1070,6 +1095,7 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
     } else if (g_pad_source.pad_index >= 0 && g_pad_source.pad_index < (int32_t)POORDS4_MAX_SLOTS) {
         primary_slot = (unsigned)g_pad_source.pad_index;
     }
+    last_bridge_status = initial_status;
     write_supervisor_state(
         "active", game_pid, session, previous_output_frames, 1);
     while (!lifecycle_should_stop()) {
@@ -1282,7 +1308,10 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
                     write_failures++;
                     consecutive_write_failures++;
                 }
-                feed_multi_controller_slots(game_pid, bridge_args, input_frames, primary_slot);
+                feed_multi_controller_slots(
+                    reader_pid, reader_args,
+                    game_pid, bridge_args, input_frames, primary_slot,
+                    &last_bridge_status, &pad);
                 last_seq = seq;
             } else {
                 stale_frames++;
@@ -1389,7 +1418,7 @@ run_game_session(pid_t reader_pid, intptr_t reader_args,
                 break;
             }
         }
-        if ((loop_count % 30u) == 0) {
+        if ((loop_count % (input_frames < 300u ? 6u : 30u)) == 0) {
             if (game_alive) {
                 PoorDS4GameBridgeStatus bridge_status;
                 memset(&bridge_status, 0, sizeof(bridge_status));

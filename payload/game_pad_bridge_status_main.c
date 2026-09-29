@@ -226,13 +226,19 @@ main(void)
             snprintf(role_buf, sizeof(role_buf), "Player %u (Simulated DS4)", s + 1);
             role = role_buf;
         } else if (sl->active || (int32_t)s == bridge.game_pad_index) {
-            snprintf(role_buf, sizeof(role_buf), "Player %u (Primary DS4)", s + 1);
+            if (sl->user_matches && (int32_t)s != bridge.game_pad_index) {
+                snprintf(role_buf, sizeof(role_buf), "Player %u Alias (Primary DS4)", s + 1);
+            } else if ((int32_t)s != bridge.game_pad_index) {
+                snprintf(role_buf, sizeof(role_buf), "Player %u (Physical DS4)", s + 1);
+            } else {
+                snprintf(role_buf, sizeof(role_buf), "Player %u (Primary DS4)", s + 1);
+            }
             role = role_buf;
         } else {
             role = "Unassigned/Empty";
         }
-        fprintf(f, "slot[%u]: role='%s' active=%u handle=0x%08x dualsense=%u sim=%u seq=%u pkts=%u calls[state=%llu,read=%llu] fallback_frames=%llu passthrough=%llu\n",
-                s, role, sl->active, (uint32_t)sl->pad_handle, sl->is_dualsense, sl->is_simulated,
+        fprintf(f, "slot[%u]: role='%s' active=%u user_matches=%u handle=0x%08x dualsense=%u sim=%u seq=%u pkts=%u calls[state=%llu,read=%llu] fallback_frames=%llu passthrough=%llu\n",
+                s, role, sl->active, sl->user_matches, (uint32_t)sl->pad_handle, sl->is_dualsense, sl->is_simulated,
                 sl->seq, sl->packets, (unsigned long long)sl->read_state_calls, (unsigned long long)sl->read_calls,
                 (unsigned long long)sl->direct_fallback_frames, (unsigned long long)sl->native_passthrough_frames);
     }
