@@ -29,7 +29,7 @@ crash. Save your gamesave before testing (it broke the save file of a game durin
 
 1. **Bluetooth Pairing**: Put your DualShock 4 into pairing mode by holding `SHARE` + `PS Button` together until the lightbar starts double-blinking rapidly. On the PS5, go to `Settings > Accessories > Bluetooth Accessories` and select **DUALSHOCK 4**.
 2. **Controller Profile**: Connect the DS4 to whichever user profile should play (Player 1 or Player 2). If Player 1 is already using a native DualSense, connect the DS4 under Player 2's profile.
-3. **Deploy Payload**: Send `PoorDS4rc44.elf` to the console's ELF loader (port 9021). The game may already be running or launched afterward.
+3. **Deploy Payload**: Send `PoorDS4rc51.elf` to the console's ELF loader (port 9021). The game may already be running or launched afterward.
 4. **Play**: Wait for the `wireless DS4 active` notification, then play normally.
 
 Only run one automatic instance. PoorDS4 follows later game launches without reinjection. It performs safe cleanup before rest mode; reinject after waking. Use `PoorDS4-stop.elf` before replacing a running build.
@@ -99,11 +99,11 @@ make -C payload CC=ps5-clang.cmd clean
 make -C payload CC=ps5-clang.cmd release audit
 ```
 
-RC44 release assets use ps5-payload-sdk v0.42:
+RC51 release assets use ps5-payload-sdk v0.42:
 
 | Output | Purpose |
 | --- | --- |
-| `PoorDS4rc44.elf` | Automatic wireless DS4 bridge |
+| `PoorDS4rc51.elf` | Automatic wireless DS4 bridge |
 | `PoorDS4-status.elf` | Read-only bridge status snapshot |
 | `PoorDS4-stop.elf` | Cooperative stop request |
 
@@ -123,6 +123,26 @@ directory and include the steps that reproduced the failure. Source and game
 reports identify `poords4_rc` and `report_schema`. Review reports before posting
 them publicly because they contain runtime process addresses and controller
 diagnostics.
+
+## Multi-Controller Support (Experimental)
+
+PoorDS4 now supports streaming multiple wireless DS4 controllers concurrently (up to 4 controllers as Player 1..Player 4), along with simulated controller channels and native DualSense passthrough. Please note that multi-controller support is currently **experimental** as I haven't done heavy testing with multiple physical DS4s yet because I don't have a reliable second DualShock 4 controller. If you have multiple DS4 controllers, please test them out and let me know how they work!
+
+## Testers Needed
+
+I need testers especially for firmwares **13.40**, **13.20**, **13.00**, **12.60**, and **9.60**. If you encounter any bugs, crashes, or want to contribute test logs, please zip the entire `/data/poords4/` folder on your PS5 and send it over in GitHub issues or reach out to me directly on Discord (`blurf.`).
+
+## Special Thanks & Shoutout
+
+A huge shoutout to [reyzinhoplayoliver-design](https://github.com/reyzinhoplayoliver-design) / `ElCauaRey` on Discord for helping with a lot of testing and finding bugs!
+
+## Donations & Support
+
+If you find PoorDS4 helpful and would like to support faster future development, hardware acquisition (like additional controllers and testing gear), and maintenance, please consider donating:
+
+- **PayPal**: [paypal.me/nblurf](https://paypal.me/nblurf)
+- **Bitcoin (BTC Network)**: `1CW8JWSnWc5w7yKhYk7ixAFG487nU5Jrzc`
+- **USDT (Tron / TRC20)**: `TRcrCeonXzgyxjR4LGzo4JdfEHYGGqD3gX`
 
 ## Attribution and license
 
