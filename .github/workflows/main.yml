@@ -17,11 +17,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential clang lld make git cmake
 
-      - name: Setup Blurf PS5 SDK
+      - name: Setup PS5 SDK
         run: |
-          git clone --recursive https://github.com/ItsBlurf/ps5-payload-sdk.git blurf-sdk || git clone --recursive https://github.com/ps5-payload-dev/sdk.git blurf-sdk
-          echo "PS5_PAYLOAD_SDK=$GITHUB_WORKSPACE/blurf-sdk" >> $GITHUB_ENV
-          echo "PS5_SDK=$GITHUB_WORKSPACE/blurf-sdk" >> $GITHUB_ENV
+          git clone --recursive https://github.com/ps5-payload-dev/sdk.git ps5-sdk
+          echo "PS5_PAYLOAD_SDK=$GITHUB_WORKSPACE/ps5-sdk" >> $GITHUB_ENV
+          echo "PS5_SDK=$GITHUB_WORKSPACE/ps5-sdk" >> $GITHUB_ENV
+
+      - name: Verify Prospero Toolchain File
+        run: |
+          if [ ! -f "$GITHUB_WORKSPACE/ps5-sdk/toolchain/prospero.mk" ]; then
+            echo "Creating missing prospero.mk link..."
+            mkdir -p $GITHUB_WORKSPACE/ps5-sdk/toolchain
+            curl -sSL https://raw.githubusercontent.com/ps5-payload-dev/sdk/main/toolchain/prospero.mk -o $GITHUB_WORKSPACE/ps5-sdk/toolchain/prospero.mk || true
+          fi
 
       - name: Build Payload
         run: |
