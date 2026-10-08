@@ -1000,6 +1000,7 @@ feed_multi_controller_slots(pid_t reader_pid, intptr_t reader_args,
     for (unsigned s = 0; s < POORDS4_MAX_SLOTS; ++s) {
         if (s == primary_slot)
             continue;
+            
         if (g_sim_mask & (1 << s)) {
             current_fed_mask |= (1 << s);
             ScePadData sim_pad;
@@ -1026,16 +1027,10 @@ feed_multi_controller_slots(pid_t reader_pid, intptr_t reader_args,
                     reader_pid, reader_args, s,
                     &physical_pad, sizeof(physical_pad), &slot_seq) == 0 &&
                 physical_pad.connected != 0) {
+                
                 current_fed_mask |= (1 << s);
                 (void)wireless_ds4_game_bridge_update_slot(
                     game_pid, bridge_args, s, &physical_pad, sizeof(physical_pad),
-                    0 /* is_simulated */, 0 /* is_dualsense */);
-            } else if (bridge_status && bridge_status->slots[s].pad_handle > 0 &&
-                       bridge_status->slots[s].user_matches &&
-                       !bridge_status->slots[s].is_dualsense && primary_pad) {
-                current_fed_mask |= (1 << s);
-                (void)wireless_ds4_game_bridge_update_slot(
-                    game_pid, bridge_args, s, primary_pad, sizeof(*primary_pad),
                     0 /* is_simulated */, 0 /* is_dualsense */);
             } else if (s_prev_fed_mask & (1 << s)) {
                 (void)wireless_ds4_game_bridge_deactivate_slot(game_pid, bridge_args, s);
