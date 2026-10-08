@@ -23,14 +23,6 @@ jobs:
           echo "PS5_PAYLOAD_SDK=$GITHUB_WORKSPACE/ps5-sdk" >> $GITHUB_ENV
           echo "PS5_SDK=$GITHUB_WORKSPACE/ps5-sdk" >> $GITHUB_ENV
 
-      - name: Verify Prospero Toolchain File
-        run: |
-          if [ ! -f "$GITHUB_WORKSPACE/ps5-sdk/toolchain/prospero.mk" ]; then
-            echo "Creating missing prospero.mk link..."
-            mkdir -p $GITHUB_WORKSPACE/ps5-sdk/toolchain
-            curl -sSL https://raw.githubusercontent.com/ps5-payload-dev/sdk/main/toolchain/prospero.mk -o $GITHUB_WORKSPACE/ps5-sdk/toolchain/prospero.mk || true
-          fi
-
       - name: Build Payload
         run: |
           cd payload
