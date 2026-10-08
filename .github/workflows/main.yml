@@ -9,15 +9,17 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang lld make git
+          sudo apt-get install -y build-essential clang lld make git cmake
 
       - name: Setup PS5 SDK
         run: |
-          git clone https://github.com/ps5-payload-dev/sdk.git ps5-sdk
+          git clone --recursive https://github.com/ps5-payload-dev/sdk.git ps5-sdk
           echo "PS5_PAYLOAD_SDK=$GITHUB_WORKSPACE/ps5-sdk" >> $GITHUB_ENV
           echo "PS5_SDK=$GITHUB_WORKSPACE/ps5-sdk" >> $GITHUB_ENV
 
