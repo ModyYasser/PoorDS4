@@ -17,11 +17,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential clang lld make git cmake
 
-      - name: Setup OpenOrbis PS5 SDK
+      - name: Setup Blurf PS5 SDK
         run: |
-          git clone --recursive https://github.com/OpenOrbis/PS5-Toolchain.push.git openorbis-sdk || git clone --recursive https://github.com/ps5-payload-dev/sdk.git openorbis-sdk
-          echo "PS5_PAYLOAD_SDK=$GITHUB_WORKSPACE/openorbis-sdk" >> $GITHUB_ENV
-          echo "PS5_SDK=$GITHUB_WORKSPACE/openorbis-sdk" >> $GITHUB_ENV
+          git clone --recursive https://github.com/ItsBlurf/ps5-payload-sdk.git blurf-sdk || git clone --recursive https://github.com/ps5-payload-dev/sdk.git blurf-sdk
+          echo "PS5_PAYLOAD_SDK=$GITHUB_WORKSPACE/blurf-sdk" >> $GITHUB_ENV
+          echo "PS5_SDK=$GITHUB_WORKSPACE/blurf-sdk" >> $GITHUB_ENV
 
       - name: Build Payload
         run: |
