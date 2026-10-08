@@ -17,9 +17,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential clang lld make git cmake
 
-      - name: Setup PS5 SDK
+      - name: Setup PS5 SDK & Toolchain Fix
         run: |
           git clone --recursive https://github.com/ps5-payload-dev/sdk.git ps5-sdk
+          mkdir -p ps5-sdk/toolchain
+          wget -O ps5-sdk/toolchain/prospero.mk https://raw.githubusercontent.com/ps5-payload-dev/sdk/master/toolchain/prospero.mk || \
+          wget -O ps5-sdk/toolchain/prospero.mk https://raw.githubusercontent.com/OpenOrbis/PS5-Toolchain/master/toolchain/prospero.mk || \
+          echo 'include $(PS5_PAYLOAD_SDK)/ps5-sdk.mk' > ps5-sdk/toolchain/prospero.mk
+          
           echo "PS5_PAYLOAD_SDK=$GITHUB_WORKSPACE/ps5-sdk" >> $GITHUB_ENV
           echo "PS5_SDK=$GITHUB_WORKSPACE/ps5-sdk" >> $GITHUB_ENV
 
