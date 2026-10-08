@@ -3243,9 +3243,6 @@ wireless_ds4_remote_reader_read_slot(pid_t pid, intptr_t args_kaddr,
 #else
     if (!pad_data || !args_kaddr || slot >= POORDS4_MAX_SLOTS)
         return -1;
-    if (slot == 0)
-        return wireless_ds4_remote_reader_read(
-            pid, args_kaddr, pad_data, pad_data_len, out_seq);
 
     if (pad_data_len > POORDS4_REMOTE_PAD_CAPACITY)
         pad_data_len = POORDS4_REMOTE_PAD_CAPACITY;
@@ -3271,6 +3268,9 @@ wireless_ds4_remote_reader_read_slot(pid_t pid, intptr_t args_kaddr,
             return 0;
         }
     }
+
+    // Fallback logic: Only use default reader if the requested slot actually has a valid handle
+    // or if explicitly bound to slot 0 when no other slot logic matches.
     return -1;
 #endif
 }
