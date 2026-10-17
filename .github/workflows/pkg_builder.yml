@@ -1,0 +1,50 @@
+name: Build PS4/PS5 Fake PKG
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-pkg:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Prepare Folder Structure
+        shell: cmd
+        run: |
+          echo Preparing Image Layout Folder...
+          if not exist pkg_build mkdir pkg_build
+          
+          xcopy /E /I /Y sce_sys pkg_build\sce_sys
+          if exist sce_module xcopy /E /I /Y sce_module pkg_build\sce_module
+          if exist fakelib xcopy /E /I /Y fakelib pkg_build\fakelib
+          if exist eboot.bin copy /Y eboot.bin pkg_build\
+          if exist *.elf copy /Y *.elf pkg_build\
+
+      - name: Download & Setup PKG Building Tools
+        shell: powershell
+        run: |
+          echo "Downloading Open-Source PKG Helpers..."
+          # تنزيل أداة بناء الـ PKG والمساعدة
+          Invoke-WebRequest -Uri "https://github.com/maaut/ps4-pkg-tool-cli/releases/download/v1.0/pkg-cli.exe" -OutFile "pkg-cli.exe" -ErrorAction SilentlyContinue || true
+
+      - name: Package Project Files
+        shell: cmd
+        run: |
+          echo Packing files into ZIP/PKG directory...
+          powershell Compress-Archive -Path pkg_build\* -DestinationPath Game_Package_Files.zip -Force
+
+      - name: Upload Output File (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: PS-Game-PKG-Package
+          path: |
+            Game_Package_Files.zip
+            *.pkg
